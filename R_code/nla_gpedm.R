@@ -1,18 +1,16 @@
-# Nested-Library Analysis (Huang, Chang & Hsieh 2024, PLOS Comp Biol) implemented
-# with Gaussian Process Empirical Dynamic Modelling (GP-EDM, Munch et al. 2017;
-# GPEDM R package by Munch & Rogers) instead of the original S-map.
+# Nested-Library Analysis (Huang, Chang & Hsieh 2024) with GP-EDM instead
+# of the original S-map.
 #
-# The two-stage fitting trick suggested by S. Munch & T. Rogers is used
-# throughout: for a given outer library {n..L}, GP hyperparameters (phi, ve,
-# sigma2) are estimated once with fitGP(). All of the "shrinking library"
-# refits sharing that outer n then reuse those hyperparameters via
-# fixedpars=, which skips the slow hyperparameter optimization and only
-# requires a (fast) matrix inversion for the new, smaller training set.
-#
-# Lag columns are built ONCE over the full observed series with makelags(),
-# before any library/test splitting: reconstructed state vectors legitimately
-# use observed history before the library start `l`, only the set of rows
-# treated as separate library points changes as the library shrinks.
+# - nla_left() / nla_right(): the paper's Algorithm 1 / Algorithm 2.
+# - Two-stage fit (Munch & Rogers): hyperparameters are fit once per outer
+#   library `n`, then reused (fixedpars=) for every shrinking-library
+#   refit -- skips the slow hyperparameter search, keeps only a fast
+#   matrix inversion.
+# - Lags are built ONCE over the full series (build_lag_frame()): a
+#   library point can legitimately use history from before its own start.
+# - Scaling is fixed ONCE over the full series, not recomputed per subset
+#   (see build_lag_frame()) -- otherwise fixedpars silently stop matching
+#   the data they're applied to as the library shrinks.
 
 suppressPackageStartupMessages({
   library(GPEDM)
