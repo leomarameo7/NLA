@@ -1,0 +1,292 @@
+---
+title: "Implement NLA with GP-EDM"
+author: "Leonardo Capitani (leocapi07@gmail.com)"
+date: "2026-07-19"
+date-modified: last-modified
+format:
+  html:
+    css: styles.css
+    toc: true
+    code-fold: true
+    code-tools: true
+    code-link: true
+    embed-resources: true
+    include-after-body:
+      text: |
+        <script>
+          document.addEventListener("DOMContentLoaded", () => {
+            document.querySelectorAll("figcaption").forEach(e => {
+              e.innerHTML = e.innerHTML.replace(/((.*?)\.)/, "<strong>$1</strong>")
+            })
+          });
+        </script>
+    crossref:
+      fig-title: "**Figure**"
+      tbl-title: "**Table**"
+      title-delim: "."
+
+execute:
+  echo: true
+  warning: false
+  message: false
+
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+```{r load_libraries}
+library(GPEDM)
+library(tidyverse)
+library(here)
+library(deSolve)
+library(zoo)
+```
+
+# Introduction:
+
+Nested Library Analysis (NLA) was proposed by [Huang et al. 2024](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1011759#sec009): *Detecting shifts in nonlinear dynamics using Empirical Dynamic Modeling with Nested-Library Analysis*.
+
+::: callout-note
+NLA is intended to answer this research question:
+
+Does the variable of interest present any change point in time?
+:::
+
+In brief, NLA steps are:  \
+\
+1 To use time series data to reconstruct the system’s dynamics (via EDM), \
+\
+2. To gradually remove older data (“shrinking the library”), and\
+\
+3. To find the point where prediction accuracy improves the most. \
+\
+That point corresponds to a regime shift, because older data comes from a different dynamical regime and actually harms prediction.
+
+[Huang et al. 2024](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1011759#sec009) found that NLA is capable to detect change points and outperforms existing approaches based on statistical characteristics. Indeed, [Huang et al. 2024](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1011759#sec009) work shows that shifts in mean and variance cannot serve as a generic signal of regime shifts.
+
+NLA repository associated to the original publication is stored [here](https://github.com/chromian/Nested-Library-Analysis).
+
+In this notebook we want to:
+
+::: callout-important
+We want:
+
+-  to replace S-map with (Gaussian Process Empirical Dynamic Modelling, [GP-EDM](https://github.com/tanyalrogers/GPEDM)) within the Nested Library Analysis framework.
+:::
+
+If you want to have more details about Gaussian Process Empirical Dynamic Modelling (GP-EDM), please read [Munch et al. 2017](https://www.sciencedirect.com/science/article/pii/S1476945X16300708?casa_token=dcpfwt1wcV4AAAAA:jL1Cs8jdYKDvyutNWVkWvaXakuoA97poyrnVGiesyTGSMstV7IjZ4KxWcUR-krFm_H97fAKoOO4) .
+
+Now it is time to implement the NLA algorithm within R and couple it with the [GP-EDM](https://github.com/tanyalrogers/GPEDM).
+
+Note that we already have some tips/suggestions from Steve Munch and Tanya Rogers, researcher that have proposed and maintain the [GP-EDM](https://github.com/tanyalrogers/GPEDM) package:
+
+- Steve's idea to fit the model in 2 stages is a good one to consider, in part because fitting the hyperparameters is slow (way slower than Smap), but prediction given data and hyperparameters is fast.
+
+- Basically, if you want to fix the training data and change the test data, you just use predict(model, newdata). If you want to change the training data (and optionally the test data) but fix the hyperparameters (e.g. to those from a previous fit), you have to 'refit' the model with fitGP, but pass the output \`pars\` as \`fixedpars\`, and it will skip optimizing the hyperparameters. Take a look at the **Cross validation and prediction heading section** ([vignettes](https://tanyalrogers.github.io/GPEDM/articles/extendedintro.html#cross-validation-and-prediction)), and hopefully that makes sense.
+
+- I think a matrix inversion has to happen whenever you change either the training data or the hyperparameters, but at least this way it will only happen once.
+
+- Steve's other idea of modifying the priors is also possible. It would require changes to the underlying code, but it's certainly doable. Steve probably has a better handle than me on what the pros and cons of that approach would be.
+
+::: callout-warning
+**Decision:**
+
+We proceed with the first idea:
+:::
+
+## The algorithm
+
+[Huang et al. 2024](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1011759#sec009) give NLA as two symmetric algorithms (their S1 Text): one that checks for a regime shift in the *left* part of a time series (library = the early part, test set = the late part) and one that checks the *right* part (test set = the early part, library = the late part). Both algorithms share the same structure:
+
+1.  Fix a test set (the part of the series held out for out-of-sample validation, at one end of the series) and an initial library (the rest of the series).
+2.  For every possible **outer** starting point `n` of the library, fit S-map's hyperparameter `theta` once, using the library `{n, ..., L}` to predict the fixed test set.
+3.  Holding that `theta` fixed, shrink the library further from an **inner** starting point `l` (`l` from `n` up to `L`), re-predicting the test set each time and recording the out-of-sample prediction error as a curve `E_n(l)`.
+4.  Smooth `E_n(.)` and, if it is valley-shaped, take the location of its minimum as a candidate change point `tau_n`. Otherwise `tau_n` is undefined (`NaN`) for that `n`.
+5.  The final estimate `tau_hat` is the median of all the (defined) `tau_n`.
+
+The key computational idea -- and the reason the two-stage GP-EDM fitting trick from Steve Munch and Tanya Rogers matters here -- is that step 2 (fitting `theta`, slow) happens once per outer `n`, while step 3 (many refits as `l` shrinks the library further) can reuse those *fixed* hyperparameters and only pay for a fast matrix inversion each time, instead of a full slow hyperparameter search.
+
+Our implementation of this (`R_code/nla_gpedm.R`) mirrors the pseudocode directly, substituting a GP-EDM fit (`fitGP()`, with hyperparameters `phi`, `ve`, `sigma2`) for the S-map fit (hyperparameter `theta`) at every step:
+
+```{r core_functions, file=here("R_code", "nla_gpedm.R")}
+```
+
+Two implementation details worth flagging:
+
+-   **Lags are built once, over the whole observed series**, before any library/test splitting. A reconstructed state vector legitimately uses observed history before the library's start `l` -- only the set of time points treated as separate *library rows* for the local regression changes as the library shrinks. Recomputing lags per subset would incorrectly discard real information.
+-   **Scaling is fixed once, over the whole series**, and `fitGP(..., scaling = "none")` is used throughout. `fitGP(..., scaling = "global")` recomputes the mean/SD from whatever rows it's given, so if we let it re-scale at every library size, the *fixed* hyperparameters from step 2 would silently stop being valid as step 3 shrinks the library (they were fit in one scaling and reused in another). This was originally a real bug in our first pass at this code: with per-subset rescaling, shrinking the library never showed the valley shape the algorithm depends on, because the (bogus) rescaling effects dominated. See @sec-synthetic for what changed once this was fixed.
+-   Huang et al. 2024 determine "valley-shaped" via a "discriminant" described in their main text (not reproduced in the supplement, which is our only available source for it). We approximate it with the sign pattern of the smoothed curve's first difference: valley-shaped means exactly one run of decreases followed by exactly one run of increases, with the minimum in the interior (not at either boundary).
+
+# Test NLA-GPEDM on synthetic data {#sec-synthetic}
+
+[Medeiros et al. 2025](https://www.pnas.org/doi/10.1073/pnas.2416637122) validate GP-EDM's ability to predict regime shifts using synthetic data from a range of simulated population dynamics models (fixed-point, cyclic, and chaotic dynamics under a changing control parameter). We attempted to extract their exact synthetic model from their Appendix S1 (`~/Documents/Git/NLA/literature`), but that PDF exceeds the tooling available in this session (20MB limit, and no local PDF-to-image renderer to fall back on page-by-page).
+
+Instead, we use the actual system Huang et al. 2024 used to validate the *original* (S-map based) NLA algorithm -- a 4-variable forced food-chain model (their Table A, S3 Text): a resource `N`, forced by a slowly increasing driver `a(t)` through a Holling type-III feedback that makes the `N` subsystem bistable over an intermediate range of `a`, feeding a 3-species chain `x -> y -> z` whose vital rates depend on `N`. Ramping `a(t)` across the upper fold of the `N` subsystem produces one abrupt regime shift that propagates through the whole food chain -- structurally exactly the kind of "control parameter drives a regime shift" test Medeiros et al. 2025 also used GP-EDM for.
+
+::: callout-warning
+**On reproducing Huang et al.'s exact parameters:** we tried to reproduce their food-chain model verbatim from the OCR'd supplementary PDF, but at least one of its fine-grained rate constants is not reliably recoverable from the scan: as OCR'd, the forcing ramp `c4 = 0.375` sweeps `a` from `0.25` to beyond `1800` over the paper's own `t` in `[0, 5000]` -- instantly blowing past any bifurcation -- and with `d1 = c0 N + c1` (`c0 = 0.75`, `c1 = 3.7`) the loss rate `d1` (~3.9) always exceeds the gain term `f1`'s own upper bound (~0.13), so the middle species collapses to 0 and the basal resource diverges, for *every* initial condition (we checked numerically). We can't tell which digit(s) were corrupted without the original source, so rather than presenting invented replacement constants as "the paper's parameters", we:
+
+-   keep the part of the model we *can* take directly, unambiguously, from the table -- the forced bistable `N` subsystem (`b = 0.8`, `m = 8`, `c = 1`, as OCR'd; we choose the ramp rate ourselves so `a(t)` sweeps across the subsystem's known fold bifurcation once, within the sampled window);
+-   replace the numerically-inconsistent 3-species chain with the well-established Hastings & Powell (1991) 3-species model instead -- the same model bundled as `HastPow3sp` in the GPEDM package itself, with the same parameters (`a=5, b=3, c=0.1, d=2, m=0.4, mu=0.01`) documented there as producing chaos, and the standard EDM-community benchmark for exactly this "a control parameter drives a food chain between fixed-point / cyclic / chaotic regimes" test;
+-   drive the Hastings-Powell chain's attack-rate parameter with the (rescaled) bistable-subsystem trajectory, so that `N`'s abrupt fold-jump forces an abrupt shift in the food chain's dynamical regime, at a precisely known time.
+
+Full details and equations are documented in `R_code/simulate_foodchain.R`.
+:::
+
+```{r foodchain_functions, file=here("R_code", "simulate_foodchain.R")}
+```
+
+```{r simulate_synthetic}
+traj <- simulate_foodchain(seed = 1)
+cp_true <- detect_true_changepoint(traj)
+cat(sprintf("Simulated series length: %d\nTrue change point (index): %d\n", nrow(traj), cp_true))
+```
+
+@fig-synthetic-traj shows the simulated trajectories: the food chain sits at a stable equilibrium while the bistable resource `N` tracks the low branch of its fold, then -- once the slowly-ramping forcing pushes `N` across the fold -- both `N` and the food chain abruptly shift regime, from a fixed point to a limit cycle.
+
+```{r fig-synthetic-traj}
+#| fig-cap: "Simulated regime shift. Top: the forced bistable resource N (the source of the abrupt jump). Middle/bottom: the driven Hastings-Powell food chain variables X and Y, which shift from a stable equilibrium to a limit cycle at the same time. Dashed line: true change point."
+traj_long <- traj %>%
+  select(time, N_raw, X, Y) %>%
+  pivot_longer(-time, names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(variable, levels = c("N_raw", "X", "Y"),
+                            labels = c("N (forcing driver)", "X", "Y")))
+
+ggplot(traj_long, aes(time, value)) +
+  geom_line() +
+  geom_vline(xintercept = traj$time[cp_true], linetype = "dashed", color = "firebrick") +
+  facet_wrap(~variable, ncol = 1, scales = "free_y") +
+  labs(x = "Time", y = NULL) +
+  theme_minimal()
+```
+
+We run NLA-GPEDM on the `Y` variable (the middle consumer). Following Huang et al. 2024, we run both the left-checking algorithm (library = the first part of the series, test set = the last part) and the right-checking algorithm (test set = the first part, library = the last part), and combine the two estimates by taking their median -- their S8 Text shows this kind of two-sided check is a useful robustness measure.
+
+```{r run_synthetic_nla}
+E <- 3; tau <- 1; Dskipstep <- 8; bandwidth <- 16
+T_syn <- nrow(traj)
+y_syn <- traj$Y
+
+left_syn  <- nla_left(y_syn,  L = 300, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+right_syn <- nla_right(y_syn, L = 80,  R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+combined_syn <- median(c(left_syn$tau_hat, right_syn$tau_hat), na.rm = TRUE)
+
+tibble(
+  estimate = c("True change point", "Left-check", "Right-check", "Combined (median)"),
+  value = c(cp_true, left_syn$tau_hat, right_syn$tau_hat, combined_syn)
+)
+```
+
+The combined estimate lands within a few percent of the true change point -- a reasonable result given the series is only `r T_syn` points long, and given the original paper's own reported precision is on a similar relative scale (their S8 Text shows spreads of roughly ±100-150 points around the true value, in a 1000-point series).
+
+@fig-synthetic-curves shows why: for outer starting points `n` before the true change point, the (smoothed) prediction-error curve as the library shrinks further is clearly valley-shaped, with the minimum landing close to the true change point; once `n` itself is already past the true change point, the library is already "clean" and no valley is found (correctly -- there is no more contamination left to detect).
+
+```{r fig-synthetic-curves}
+#| fig-cap: "NLA-GPEDM error curves (left-checking algorithm) for a few outer starting points n. Grey: raw RMSE. Blue: Gaussian-smoothed curve used for valley detection. Dashed red: true change point."
+curves_syn <- left_syn$curves %>% filter(n %in% c(0, 40, 80, 120, 160))
+
+ggplot(curves_syn, aes(l, rmse)) +
+  geom_point(color = "grey60", size = 1) +
+  geom_line(aes(y = rmse_smooth), color = "steelblue", linewidth = 0.8) +
+  geom_vline(xintercept = traj$time[cp_true], linetype = "dashed", color = "firebrick") +
+  facet_wrap(~n, labeller = label_both) +
+  labs(x = "Library start l", y = "Out-of-sample RMSE") +
+  theme_minimal()
+```
+
+# Test NLA-GPEDM on empirical data
+
+To test our approach on real data we use the well-known case of lakes shifting from a eutrophic to an oligotrophic regime: monthly time-series data from Lake Zurich for 13 plankton functional groups, phosphate concentration (the control parameter), and water temperature ([Merz et al. 2023](https://www.nature.com/articles/s41558-023-01615-6)). [Medeiros et al. 2025](https://www.pnas.org/doi/10.1073/pnas.2416637122) ran a change-point analysis on this same dataset and found large green algae had the most well-resolved shift (November 1987, at a phosphate concentration of 0.0472 mg/l), followed by small cryptophytes (October 1988) and omnivores (June 1986) -- occurring close enough together to suggest an ecosystem-wide shift (@fig-medeiros5).
+
+![This figure was made by Medeiros et al. 2025. It is fig. 5 in the referred paper.](figures/medeiros_fig5.png){#fig-medeiros5}
+
+We test whether NLA-GPEDM recovers similar timing for these same three functional groups.
+
+```{r zurich_functions, file=here("R_code", "process_zurich_data.R")}
+```
+
+```{r load_zurich_data}
+z <- process_zurich_data(here("data", "raw", "lake_zurich.csv"), start_year = 1977, end_year = 1999)
+cat(sprintf("Processed series: %d months (%s to %s)\n", nrow(z), format(min(z$date)), format(max(z$date))))
+```
+
+The raw counts are highly right-skewed (log1p-transformed below, standard practice for plankton abundance data), and the handful (5, out of 528 months in the raw file) of scattered single-month gaps are linearly interpolated. We restrict to 1977-1999 (still with generous margin on both sides of the 1986-1988 shifts Medeiros et al. found) to keep the nested-library computation to a reasonable size.
+
+```{r fig-zurich-traj}
+#| fig-cap: "Log-abundance of the three Lake Zurich functional groups Medeiros et al. 2025 flagged as showing the clearest regime shift. Dashed lines: their reported change-point dates."
+ref_dates <- tribble(
+  ~variable, ~ref_date,
+  "Green algae (large)", as.Date("1987-11-01"),
+  "Cryptophytes (small)", as.Date("1988-10-01"),
+  "Omnivores", as.Date("1986-06-01")
+)
+
+z %>%
+  select(date, log_Gr2, log_Cr1, log_Om) %>%
+  pivot_longer(-date, names_to = "variable", values_to = "value") %>%
+  mutate(variable = recode(variable, log_Gr2 = "Green algae (large)",
+                            log_Cr1 = "Cryptophytes (small)", log_Om = "Omnivores")) %>%
+  ggplot(aes(date, value)) +
+  geom_line() +
+  geom_vline(data = ref_dates, aes(xintercept = ref_date), linetype = "dashed", color = "firebrick") +
+  facet_wrap(~variable, ncol = 1, scales = "free_y") +
+  labs(x = "Date", y = "log(1 + abundance)") +
+  theme_minimal()
+```
+
+```{r tbl-zurich-summary}
+#| tbl-cap: "NLA-GPEDM detected change points vs. Medeiros et al. 2025's change-point analysis, for the three Lake Zurich functional groups they flagged."
+focal_vars <- list(
+  Gr2 = list(col = "log_Gr2", ref_year = 1987, ref_month = 11, label = "Green algae (large)"),
+  Cr1 = list(col = "log_Cr1", ref_year = 1988, ref_month = 10, label = "Cryptophytes (small)"),
+  Om  = list(col = "log_Om",  ref_year = 1986, ref_month = 6,  label = "Omnivores")
+)
+
+T_z <- nrow(z)
+zurich_results <- map(focal_vars, function(spec) {
+  y <- z[[spec$col]]
+  ref_idx <- zurich_month_index(z, spec$ref_year, spec$ref_month)
+  left  <- nla_left(y,  L = 200, R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+  right <- nla_right(y, L = 60,  R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+  list(label = spec$label, ref_idx = ref_idx, left = left, right = right,
+       combined = median(c(left$tau_hat, right$tau_hat), na.rm = TRUE))
+})
+
+zurich_summary <- map_dfr(zurich_results, function(r) {
+  tibble(Variable = r$label,
+         `Medeiros et al. date` = format(z$date[r$ref_idx], "%Y-%m"),
+         `Medeiros et al. index` = r$ref_idx,
+         `NLA-GPEDM left` = r$left$tau_hat,
+         `NLA-GPEDM right` = r$right$tau_hat,
+         `NLA-GPEDM combined` = r$combined,
+         `NLA-GPEDM date` = format(z$date[round(r$combined)], "%Y-%m"))
+})
+zurich_summary
+```
+
+::: callout-note
+**Result.** NLA-GPEDM's absolute estimates land systematically 21-32 months later than Medeiros et al.'s change-point analysis for all three functional groups (@tbl-zurich-summary is the `zurich_summary` table above) -- so we would *not* claim precise agreement on the calendar date of the shift. What *is* recovered correctly is the **relative ordering across variables**: Medeiros et al. found Omnivores shifted earliest, then Green algae (large), then Cryptophytes (small) -- and NLA-GPEDM reproduces that exact ordering, with a similar (~20-30 month) spread between them. That ordering is precisely the pattern Medeiros et al. use to argue for an *ecosystem-wide* shift rather than three independent, unrelated events, and NLA-GPEDM -- built from an entirely different method (nested-library GP-EDM vs. their change-point model) -- agrees with it.
+:::
+
+@fig-zurich-curves shows the error curves behind the Green algae (large) result, analogous to @fig-synthetic-curves.
+
+```{r fig-zurich-curves}
+#| fig-cap: "NLA-GPEDM error curves (left-checking algorithm) for Green algae (large), for a few outer starting points n. Dashed red: Medeiros et al.'s reported change point (November 1987)."
+gr2_curves <- zurich_results$Gr2$left$curves %>% filter(n %in% c(0, 40, 80, 120, 160))
+ref_idx_gr2 <- zurich_results$Gr2$ref_idx
+
+ggplot(gr2_curves, aes(l, rmse)) +
+  geom_point(color = "grey60", size = 1) +
+  geom_line(aes(y = rmse_smooth), color = "steelblue", linewidth = 0.8) +
+  geom_vline(xintercept = ref_idx_gr2, linetype = "dashed", color = "firebrick") +
+  facet_wrap(~n, labeller = label_both) +
+  labs(x = "Library start l (month index)", y = "Out-of-sample RMSE") +
+  theme_minimal()
+```
+
+# Conclusion
+
+We implemented Huang et al. 2024's Nested-Library Analysis algorithm in R, replacing S-map with GP-EDM as suggested by Steve Munch and Tanya Rogers's two-stage fitting trick (fit hyperparameters once per outer library, then reuse them via `fixedpars` while shrinking the library further). On a synthetic food-chain regime shift, the combined (left+right) estimate lands within a few percent of the true, known change point. On the real Lake Zurich plankton dataset, absolute timing differs systematically from Medeiros et al. 2025's independent change-point analysis, but the *relative ordering* of the shift across three functional groups -- their key evidence for an ecosystem-wide regime shift -- is exactly reproduced.
+
+Natural next steps: a proper sensitivity analysis over `E`, `tau`, `Dskipstep`, and the smoothing bandwidth (we used one reasonable default throughout, not a tuned choice); testing more Lake Zurich functional groups; and revisiting the exact discriminant Huang et al. 2024 use for "valley-shapedness" if the full main text (rather than just the supplement) becomes available.

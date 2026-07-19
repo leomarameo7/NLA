@@ -1,0 +1,14 @@
+/* Minimal custom styling for the NLA-GPEDM notebook. */
+
+.callout-important {
+  border-left-color: #b35900;
+}
+
+figcaption {
+  font-size: 0.95em;
+  color: #444;
+}
+
+code {
+  font-size: 0.92em;
+}
