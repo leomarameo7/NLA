@@ -6,7 +6,7 @@
 
 This repository contains data and code to implement Nested Library Analysis (NLA) in R by using [Gaussian Process-EDM](https://tanyalrogers.github.io/GPEDM) method (Munch, S. & Rogers, T. 2025). NLA was proposed by [Huang et al. 2024](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1011759#sec009): *Detecting shifts in nonlinear dynamics using Empirical Dynamic Modeling with Nested-Library Analysis*.
 
-### Background: 
+### Background:
 
 NLA was presented to answer this research question: Does the variable of interest present any change point in time?
 
@@ -17,6 +17,10 @@ NLA repository associated to the original publication is stored [here](https://g
 ### Goal
 
 We aim to translate the NLA core algorithms into R and we want to actualize the Empirical Dynamic Modelling prediction method from S-Map to Gaussian Processes (GP).
+
+### Status
+
+A first working implementation (NLA-GPEDM: Huang et al. 2024's algorithm, with GP-EDM in place of S-map) lives in `R_code/nla_gpedm.R`, validated on a synthetic regime-shift model (`R_code/simulate_foodchain.R`) and applied to the Lake Zurich plankton dataset (`R_code/process_zurich_data.R`, `R_code/run_zurich_analysis.R`). See `quarto_notebooks/1_implement.qmd` for the full write-up, including the modelling choices made where the original paper's supplementary PDF could not be fully recovered via OCR.
 
 ### License
 
