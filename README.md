@@ -20,7 +20,7 @@ We aim to translate the NLA core algorithms into R and we want to actualize the 
 
 ### Status
 
-A first working implementation (NLA-GPEDM: Huang et al. 2024's algorithm, with GP-EDM in place of S-map) lives in `R_code/nla_gpedm.R`, validated on a synthetic regime-shift model (`R_code/simulate_foodchain.R`) and applied to the Lake Zurich plankton dataset (`R_code/process_zurich_data.R`, `R_code/run_zurich_analysis.R`). See `quarto_notebooks/1_implement.qmd` for the full write-up, including the modelling choices made where the original paper's supplementary PDF could not be fully recovered via OCR.
+A first working implementation (NLA-GPEDM: Huang et al. 2024's algorithm, with GP-EDM in place of S-map) lives entirely in `quarto_notebooks/1_implement.qmd` -- validated on a synthetic regime-shift model and applied to the (full, z-scored) Lake Zurich plankton dataset. All code lives in that notebook; there are no standalone R scripts.
 
 ### License
 

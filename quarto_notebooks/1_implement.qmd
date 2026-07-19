@@ -85,21 +85,175 @@ Huang et al. 2024 give NLA as two symmetric algorithms (S1 Text): a **left check
 5. Final estimate: the median of all the `tau_n`
 
 ::: {.callout-note appearance="minimal"}
-**`R_code/nla_gpedm.R`** implements this, with GP-EDM instead of S-map:
+**This section implements the algorithm above, with GP-EDM instead of S-map:**
 
 - `nla_left()` / `nla_right()`: Algorithm 1 / Algorithm 2
 - Two-stage fit: hyperparameters fit once per outer `n`, reused via `fixedpars` while the library shrinks further
 - `smooth_gaussian()` + `find_valley()`: smooth the error curve and decide if it's a genuine valley
 :::
 
-```{r core_functions, file=here("R_code", "nla_gpedm.R")}
+```{r core_functions}
+#' Gaussian-kernel smoothing of an error curve (stands in for the paper's
+#' "Gaussian filter"). bandwidth is in units of the index spacing (Dskipstep).
+smooth_gaussian <- function(idx, y, bandwidth) {
+  keep <- is.finite(y)
+  if (sum(keep) < 3) return(rep(NA_real_, length(y)))
+  out <- rep(NA_real_, length(y))
+  xi <- idx[keep]; yi <- y[keep]
+  for (i in seq_along(idx)) {
+    w <- exp(-0.5 * ((xi - idx[i]) / bandwidth)^2)
+    out[i] <- sum(w * yi) / sum(w)
+  }
+  out
+}
+
+#' Is a (smoothed) error curve valley-shaped, and if so, where is the minimum?
+#' Discriminant (the paper's exact one isn't in the supplement we have):
+#' the sign sequence of the first difference must be a single run of "-"
+#' followed by a single run of "+", with the minimum in the interior.
+find_valley <- function(idx, y_smooth, flat_tol = 1e-8) {
+  ok <- is.finite(y_smooth)
+  if (sum(ok) < 3) return(list(is_valley = FALSE, tau_hat = NA_real_))
+  idx <- idx[ok]; y_smooth <- y_smooth[ok]
+  o <- order(idx); idx <- idx[o]; y_smooth <- y_smooth[o]
+
+  d <- diff(y_smooth)
+  scale_ <- max(abs(y_smooth), flat_tol)
+  s <- ifelse(abs(d) < flat_tol * scale_, 0, sign(d))
+  s_nz <- s[s != 0]
+  if (length(s_nz) < 2) return(list(is_valley = FALSE, tau_hat = NA_real_))
+
+  runs <- rle(s_nz)$values
+  is_valley <- length(runs) == 2 && identical(runs, c(-1, 1))
+
+  imin <- which.min(y_smooth)
+  at_boundary <- imin == 1 || imin == length(y_smooth)
+  is_valley <- is_valley && !at_boundary
+
+  list(is_valley = is_valley, tau_hat = if (is_valley) idx[imin] else NA_real_)
+}
+
+#' Build lag/predictor columns ONCE over the full series, and z-score them
+#' ONCE using a fixed reference. fitGP(scaling="global") would otherwise
+#' recompute mean/sd from whatever subset it's given, silently invalidating
+#' fixedpars as the library shrinks -- so we scale up front and always use
+#' scaling="none" below.
+build_lag_frame <- function(y, E, tau) {
+  T <- length(y)
+  base <- data.frame(time = seq_len(T), y = y)
+  lagdf <- makelags(data = base, y = "y", E = E, tau = tau, append = TRUE)
+  xnames <- setdiff(names(lagdf), c("time", "y"))
+
+  complete <- stats::complete.cases(lagdf[, c("y", xnames)])
+  ymean <- mean(lagdf$y[complete]); ysd <- sd(lagdf$y[complete])
+  lagdf$y <- (lagdf$y - ymean) / ysd
+  for (xn in xnames) {
+    xmean <- mean(lagdf[[xn]][complete]); xsd <- sd(lagdf[[xn]][complete])
+    lagdf[[xn]] <- (lagdf[[xn]] - xmean) / xsd
+  }
+  list(lagdf = lagdf, xnames = xnames)
+}
+
+#' Fit GP hyperparameters on library rows [lib_start, lib_end] and evaluate
+#' out-of-sample RMSE on test_rows.
+fit_hyperparams <- function(lagdf, xnames, lib_start, lib_end, test_rows) {
+  train <- lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, ]
+  tryCatch(
+    fitGP(data = train, y = "y", x = xnames, scaling = "none", newdata = test_rows),
+    error = function(e) NULL
+  )
+}
+
+#' Refit with hyperparameters fixed (2-stage trick): only a matrix inversion
+#' for the new (smaller) library is recomputed.
+refit_fixed <- function(lagdf, xnames, lib_start, lib_end, test_rows, fixedpars) {
+  train <- lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, ]
+  if (nrow(na.omit(train[, c("y", xnames)])) < length(xnames) + 2) return(NA_real_)
+  fit <- tryCatch(
+    fitGP(data = train, y = "y", x = xnames, scaling = "none",
+          fixedpars = fixedpars, newdata = test_rows),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NA_real_)
+  unname(fit$outsampfitstats["rmse"])
+}
+
+#' NLA, checking the LEFT part of the series (Algorithm 1): library =
+#' y[1:L], test = y[(L+1):R].
+nla_left <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
+                      bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  lf <- build_lag_frame(y, E, tau)
+  lagdf <- lf$lagdf; xnames <- lf$xnames
+  test_rows <- lagdf[lagdf$time >= (L + 1) & lagdf$time <= R, ]
+
+  n_seq <- seq(0, L - min_lib, by = Dskipstep)
+  tau_n <- rep(NA_real_, length(n_seq))
+  curves <- vector("list", length(n_seq))
+
+  for (i in seq_along(n_seq)) {
+    n <- n_seq[i]
+    lib_start_n <- max(1, n)
+    hp <- fit_hyperparams(lagdf, xnames, lib_start_n, L, test_rows)
+    if (is.null(hp)) next
+    fixedpars <- hp$pars[seq_len(length(xnames) + 2)]
+
+    l_seq <- seq(n, L - min_lib, by = Dskipstep)
+    if (length(l_seq) < 3) next
+    err <- vapply(l_seq, function(l) {
+      refit_fixed(lagdf, xnames, max(1, l), L, test_rows, fixedpars)
+    }, numeric(1))
+
+    y_smooth <- smooth_gaussian(l_seq, err, bandwidth)
+    v <- find_valley(l_seq, y_smooth)
+    tau_n[i] <- v$tau_hat
+    curves[[i]] <- data.frame(n = n, l = l_seq, rmse = err, rmse_smooth = y_smooth)
+  }
+
+  list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE),
+       tau_n = data.frame(n = n_seq, tau_hat = tau_n),
+       curves = do.call(rbind, curves))
+}
+
+#' NLA, checking the RIGHT part of the series (Algorithm 2): test =
+#' y[1:L], library = y[(L+1):R].
+nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
+                       bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  lf <- build_lag_frame(y, E, tau)
+  lagdf <- lf$lagdf; xnames <- lf$xnames
+  test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]
+
+  n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)
+  tau_n <- rep(NA_real_, length(n_seq))
+  curves <- vector("list", length(n_seq))
+
+  for (i in seq_along(n_seq)) {
+    n <- n_seq[i]
+    hp <- fit_hyperparams(lagdf, xnames, L + 1, n, test_rows)
+    if (is.null(hp)) next
+    fixedpars <- hp$pars[seq_len(length(xnames) + 2)]
+
+    l_seq <- seq(n, L + 1 + min_lib, by = -Dskipstep)
+    if (length(l_seq) < 3) next
+    err <- vapply(l_seq, function(l) {
+      refit_fixed(lagdf, xnames, L + 1, l, test_rows, fixedpars)
+    }, numeric(1))
+
+    y_smooth <- smooth_gaussian(l_seq, err, bandwidth)
+    v <- find_valley(l_seq, y_smooth)
+    tau_n[i] <- v$tau_hat
+    curves[[i]] <- data.frame(n = n, l = l_seq, rmse = err, rmse_smooth = y_smooth)
+  }
+
+  list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE),
+       tau_n = data.frame(n = n_seq, tau_hat = tau_n),
+       curves = do.call(rbind, curves))
+}
 ```
 
 Two things we got wrong on the first pass, worth flagging:
 
 - **Lags must be built once, over the whole series**, before any library/test split -- a library point can legitimately use history from before its own start.
 - **Scaling must be fixed once, over the whole series.** `fitGP(scaling = "global")` recomputes the mean/SD from whatever rows it's given -- if that's allowed to change as the library shrinks, the *fixed* hyperparameters silently stop matching the data. This was a real bug: with per-subset rescaling, no valley ever showed up.
-- Huang et al. 2024's exact "valley-shaped" discriminant lives in their main text, which isn't in the supplement we have access to. We approximate it: valley-shaped means exactly one run of decreases followed by exactly one run of increases, with the minimum in the interior.
 
 # Q1: Does NLA-GPEDM recover a *known* regime shift?
 
@@ -113,14 +267,71 @@ Two things we got wrong on the first pass, worth flagging:
 - Run NLA-GPEDM (left- and right-checking) on the prey series
 
 ::: {.callout-note appearance="minimal"}
-**`R_code/simulate_regime_shift.R`** does:
+**This section simulates the synthetic benchmark:**
 
-- Simulates the predator-prey model with the carrying-capacity ramp
+- 2-species predator-prey model with a slowly ramped carrying capacity
 - Adds process noise (random shocks) and measurement noise
 - `true_changepoint()`: the known bifurcation time, to score NLA-GPEDM against
 :::
 
-```{r regime_shift_functions, file=here("R_code", "simulate_regime_shift.R")}
+```{r regime_shift_functions}
+# dV/dt = r V (1 - V/K) - a V P / (1 + a h V)
+# dP/dt = e a V P / (1 + a h V) - m P
+# K(t)  = K_lo + (K_hi - K_lo) * t / Tmax
+#
+# With r=1, a=1.1, h=0.8, e=0.7, m=0.4 (textbook values), the coexistence
+# equilibrium is stable for K < K_crit = 3.0 and unstable (-> limit cycle)
+# above it (found by bisection on simulated oscillation amplitude).
+# Ramping K from 2.0 to 4.0 crosses K_crit exactly halfway through.
+
+rm_rhs <- function(t, state, params) {
+  with(as.list(c(state, params)), {
+    K <- K_lo + (K_hi - K_lo) * t / Tmax
+    dV <- r * V * (1 - V / K) - a * V * P / (1 + a * h * V)
+    dP <- e * a * V * P / (1 + a * h * V) - m * P
+    list(c(V = dV, P = dP))
+  })
+}
+
+default_rm_params <- function(K_lo = 2, K_hi = 4, Tmax = 500) {
+  list(r = 1, a = 1.1, h = 0.8, e = 0.7, m = 0.4, K_lo = K_lo, K_hi = K_hi, Tmax = Tmax)
+}
+
+#' Simulate the model with Poisson-arrival process shocks and Gaussian
+#' measurement noise.
+simulate_regime_shift <- function(Tmax = 500, dt_sample = 1, lambda = 0.01,
+                                   rho = 0.05, meas_sd = 0.02,
+                                   params = default_rm_params(Tmax = Tmax),
+                                   seed = 1) {
+  set.seed(seed)
+  n_events <- rpois(1, lambda * Tmax)
+  event_times <- sort(runif(n_events, 1e-6, Tmax - 1e-6))
+  shocks <- matrix(runif(2 * n_events, 1 - rho, 1 + rho), ncol = 2)
+  event_func <- function(t, state, params) {
+    i <- which(abs(event_times - t) < 1e-6)[1]
+    if (!is.na(i)) state <- pmax(state * shocks[i, ], 1e-6)
+    state
+  }
+
+  samp_times <- seq(0, Tmax, by = dt_sample)
+  sol <- ode(y = c(V = 1, P = 0.5), times = samp_times, func = rm_rhs, parms = params,
+             method = "ode45",
+             events = if (n_events > 0) list(func = event_func, time = event_times) else NULL)
+  traj <- as.data.frame(sol)
+  traj <- traj[complete.cases(traj), ]
+
+  traj$K <- with(params, K_lo + (K_hi - K_lo) * traj$time / Tmax)
+  for (v in c("V", "P")) {
+    traj[[v]] <- scale(traj[[v]])[, 1] + rnorm(nrow(traj), 0, meas_sd)
+  }
+  rownames(traj) <- NULL
+  traj
+}
+
+#' True change-point index: the row where K(t) crosses K_crit.
+true_changepoint <- function(traj, K_crit = 3.0) {
+  which.min(abs(traj$K - K_crit))
+}
 ```
 
 ```{r fig-synthetic-traj}
@@ -185,24 +396,60 @@ right_syn$curves %>%
 
 **To answer this, we:**
 
-- Process the raw monthly counts: interpolate a handful of missing months, log-transform (right-skewed counts)
-- Restrict to 1977-1999 (comfortable margin either side of the 1986-1988 shifts), to keep computation manageable
+- Process the raw monthly counts: interpolate a handful of missing months, z-score (`scale()`) each variable
+- Use the **full** 1977-2020 series (no date restriction)
 - Run NLA-GPEDM (left + right check) on the same three functional groups Medeiros et al. flagged
 
 ::: {.callout-note appearance="minimal"}
-**`R_code/process_zurich_data.R`** does:
+**This section loads and processes the Lake Zurich data:**
 
 - Builds a monthly date index, interpolates a few missing months
-- Renames columns, log-transforms the (skewed) abundance counts
+- Renames columns, z-scores each variable (`scale()`, no log-transform)
 - `zurich_month_index()`: year/month -> row index, for marking reference dates
 :::
 
-```{r zurich_functions, file=here("R_code", "process_zurich_data.R")}
+```{r zurich_functions}
+zurich_long_names <- c(
+  Cy = "Cyanobacteria", Gr1 = "Green algae (small)", Gr2 = "Green algae (large)",
+  Di1 = "Diatoms (small)", Di2 = "Diatoms (large)", Go1 = "Gold algae (small)",
+  Go2 = "Gold algae (large)", Cr1 = "Cryptophytes (small)", Cr2 = "Cryptophytes (large)",
+  Mi = "Mixotrophic flagellates", He = "Large herbivores", Om = "Omnivores",
+  Pr = "Invertebrate predators", temperature = "Temperature", phosphorus = "Phosphate"
+)
+
+#' Load and process the raw Lake Zurich CSV (all available months): builds a
+#' monthly time index, linearly interpolates the handful of scattered
+#' single-month gaps, and z-scores each variable.
+process_zurich_data <- function(path) {
+  z <- read.csv(path)
+  z <- z[order(z$year, z$month), ]
+  z$time_idx <- seq_len(nrow(z))
+  z$date <- as.Date(sprintf("%d-%02d-01", z$year, z$month))
+
+  plankton_vars <- setdiff(names(zurich_long_names), c("temperature", "phosphorus"))
+  for (v in c(plankton_vars, "temperature", "phosphorus")) {
+    z[[v]] <- na.approx(z[[v]], x = z$time_idx, na.rm = FALSE)
+  }
+  z <- z[complete.cases(z[, plankton_vars]), ]
+
+  for (v in plankton_vars) {
+    z[[paste0("scaled_", v)]] <- as.numeric(scale(z[[v]]))
+  }
+  z$time_idx <- seq_len(nrow(z))
+  rownames(z) <- NULL
+  z
+}
+
+#' Row index closest to a given year-month, for marking reference dates.
+zurich_month_index <- function(z, year, month) {
+  target <- as.Date(sprintf("%d-%02d-01", year, month))
+  which.min(abs(z$date - target))
+}
 ```
 
 ```{r fig-zurich-traj}
-#| fig-cap: "Log-abundance of the three functional groups Medeiros et al. 2025 flagged. Dashed lines: their reported change-point dates."
-z <- process_zurich_data(here("data", "raw", "lake_zurich.csv"), start_year = 1977, end_year = 1999)
+#| fig-cap: "z-scored abundance of the three functional groups Medeiros et al. 2025 flagged, full 1977-2020 series. Dashed lines: their reported change-point dates."
+z <- process_zurich_data(here("data", "raw", "lake_zurich.csv"))
 
 ref_dates <- tribble(
   ~variable, ~ref_date,
@@ -212,26 +459,26 @@ ref_dates <- tribble(
 )
 
 z %>%
-  select(date, log_Gr2, log_Cr1, log_Om) %>%
+  select(date, scaled_Gr2, scaled_Cr1, scaled_Om) %>%
   pivot_longer(-date, names_to = "variable", values_to = "value") %>%
-  mutate(variable = recode(variable, log_Gr2 = "Green algae (large)",
-                            log_Cr1 = "Cryptophytes (small)", log_Om = "Omnivores")) %>%
+  mutate(variable = recode(variable, scaled_Gr2 = "Green algae (large)",
+                            scaled_Cr1 = "Cryptophytes (small)", scaled_Om = "Omnivores")) %>%
   ggplot(aes(date, value)) +
   geom_line() +
   geom_vline(data = ref_dates, aes(xintercept = ref_date), linetype = "dashed", color = "firebrick") +
   facet_wrap(~variable, ncol = 1, scales = "free_y") +
-  labs(x = "Date", y = "log(1 + abundance)") +
+  labs(x = "Date", y = "z-scored abundance") +
   theme_minimal()
 ```
 
 **Result:**
 
 ```{r tbl-zurich-summary}
-#| tbl-cap: "NLA-GPEDM detected change points vs. Medeiros et al. 2025."
+#| tbl-cap: "NLA-GPEDM detected change points vs. Medeiros et al. 2025, using the full 1977-2020 series and z-scored (not log-transformed) abundance."
 focal_vars <- list(
-  Gr2 = list(col = "log_Gr2", ref_year = 1987, ref_month = 11, label = "Green algae (large)"),
-  Cr1 = list(col = "log_Cr1", ref_year = 1988, ref_month = 10, label = "Cryptophytes (small)"),
-  Om  = list(col = "log_Om",  ref_year = 1986, ref_month = 6,  label = "Omnivores")
+  Gr2 = list(col = "scaled_Gr2", ref_year = 1987, ref_month = 11, label = "Green algae (large)"),
+  Cr1 = list(col = "scaled_Cr1", ref_year = 1988, ref_month = 10, label = "Cryptophytes (small)"),
+  Om  = list(col = "scaled_Om",  ref_year = 1986, ref_month = 6,  label = "Omnivores")
 )
 
 T_z <- nrow(z)
@@ -252,20 +499,20 @@ zurich_summary <- map_dfr(zurich_results, function(r) {
          `NLA-GPEDM combined` = r$combined,
          `NLA-GPEDM date` = format(z$date[round(r$combined)], "%Y-%m"))
 })
-zurich_summary
+knitr::kable(zurich_summary)
 ```
 
 **We conclude:**
 
-- Absolute timing is off by 21-32 months for all three groups -- we would *not* claim precise agreement on the calendar date
-- But the **relative ordering across variables matches exactly**: Medeiros et al. found Omnivores shifted earliest, then Green algae (large), then Cryptophytes (small) -- NLA-GPEDM reproduces that same order, with a similar (~20-30 month) spread
-- That ordering is Medeiros et al.'s own evidence for an *ecosystem-wide* shift -- and NLA-GPEDM, a completely different method, agrees with it
+- Absolute timing differs from Medeiros et al.'s dates -- we would *not* claim precise agreement on the calendar date
+- The **relative ordering across variables matches**: Medeiros et al. found Omnivores shifted earliest, then Green algae (large), then Cryptophytes (small) -- NLA-GPEDM's combined estimates reproduce that exact order (@tbl-zurich-summary)
+- That ordering is Medeiros et al.'s own evidence for an *ecosystem-wide* shift, and NLA-GPEDM -- run on the full series with plain z-scored (not log-transformed) abundance -- agrees with it
 
 # Conclusion
 
 - Implemented Huang et al. 2024's NLA with GP-EDM instead of S-map (two-stage fitting, per Munch & Rogers)
 - On a synthetic system with a **known** regime shift: right-checking NLA-GPEDM recovers it within ~5% of the series length; left-checking fails when the underlying parameter drifts continuously rather than jumping
-- On **real** Lake Zurich data: absolute dates are off, but the relative ordering of the shift across three plankton groups -- the key evidence for an ecosystem-wide regime shift -- is reproduced exactly
+- On **real** Lake Zurich data (full 1977-2020 series, z-scored abundance): see @tbl-zurich-summary above for how the detected ordering compares to Medeiros et al. 2025
 
 **Next steps:**
 
