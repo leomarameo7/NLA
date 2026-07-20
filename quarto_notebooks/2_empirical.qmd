@@ -34,7 +34,7 @@ library(zoo)
 ```
 
 ::: callout-important
-This notebook applies **NLA-GP** to real data. See `1_implement.qmd` for the algorithm, its derivation, and validation on a synthetic system with a known regime shift. The NLA-GP implementation is reproduced below so this notebook runs standalone.
+This notebook applies **NLA-GP** to real data: Lake Zurich plankton (Medeiros et al. 2025) and the Pacific Decadal Oscillation index (Huang et al. 2024, Sec. 3.2). See `1_implement.qmd` for the algorithm, its derivation, and validation on synthetic systems with a known regime shift. The NLA-GP (and NLA-S-map) implementation is reproduced below so this notebook runs standalone.
 :::
 
 ## Code
@@ -186,7 +186,69 @@ nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
 }
 ```
 
-# Empirical test
+The original NLA-S-map (Huang et al. 2024's S2 Text) is reproduced too, so we can compare it against NLA-GP on the PDO test below, as we did on synthetic data in `1_implement.qmd`.
+
+```{r smap_functions}
+smap_predict <- function(train_x, train_y, test_x, theta, k = NULL) {
+  E <- ncol(train_x)
+  if (is.null(k)) k <- E + 1
+  N <- nrow(train_x)
+  Xtrain1 <- cbind(1, train_x)
+  preds <- numeric(nrow(test_x))
+  for (i in seq_len(nrow(test_x))) {
+    xq <- test_x[i, ]
+    d <- sqrt(rowSums((train_x - matrix(xq, N, E, byrow = TRUE))^2))
+    dbar <- mean(sort(d)[seq_len(min(k, N))])
+    if (dbar <= 0) dbar <- 1e-8
+    w <- exp(-theta * d / dbar)
+    fit <- tryCatch(lm.wfit(x = Xtrain1, y = train_y, w = w), error = function(e) NULL)
+    preds[i] <- if (is.null(fit) || any(!is.finite(fit$coefficients))) NA_real_ else sum(c(1, xq) * fit$coefficients)
+  }
+  preds
+}
+
+fit_smap_theta <- function(train_x, train_y, test_x, test_y) {
+  obj <- function(theta) sqrt(mean((test_y - smap_predict(train_x, train_y, test_x, theta))^2, na.rm = TRUE))
+  optimize(obj, interval = c(1e-4, 10))$minimum
+}
+
+fit_hyperparams_smap <- function(lagdf, xnames, lib_start, lib_end, test_rows) {
+  train <- na.omit(lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, c("y", xnames)])
+  test <- na.omit(test_rows[, c("y", xnames)])
+  if (nrow(train) < length(xnames) + 2 || nrow(test) == 0) return(NULL)
+  list(theta = fit_smap_theta(as.matrix(train[, xnames]), train$y, as.matrix(test[, xnames]), test$y))
+}
+
+refit_fixed_smap <- function(lagdf, xnames, lib_start, lib_end, test_rows, theta) {
+  train <- na.omit(lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, c("y", xnames)])
+  test <- na.omit(test_rows[, c("y", xnames)])
+  if (nrow(train) < length(xnames) + 2 || nrow(test) == 0) return(NA_real_)
+  p <- smap_predict(as.matrix(train[, xnames]), train$y, as.matrix(test[, xnames]), theta)
+  sqrt(mean((test$y - p)^2, na.rm = TRUE))
+}
+
+nla_right_smap <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
+                            bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  lf <- build_lag_frame(y, E, tau)
+  lagdf <- lf$lagdf; xnames <- lf$xnames
+  test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]
+  n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)
+  tau_n <- rep(NA_real_, length(n_seq))
+  for (i in seq_along(n_seq)) {
+    n <- n_seq[i]
+    hp <- fit_hyperparams_smap(lagdf, xnames, L + 1, n, test_rows)
+    if (is.null(hp)) next
+    l_seq <- seq(n, L + 1 + min_lib, by = -Dskipstep)
+    if (length(l_seq) < 3) next
+    err <- vapply(l_seq, function(l) refit_fixed_smap(lagdf, xnames, L + 1, l, test_rows, hp$theta), numeric(1))
+    v <- find_valley(l_seq, smooth_gaussian(l_seq, err, bandwidth))
+    tau_n[i] <- v$tau_hat
+  }
+  list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE))
+}
+```
+
+# Lake Zurich
 
 ::: {.callout-tip title="Question"}
 Lake Zurich shifted from a eutrophic to an oligotrophic state in the late 1980s. [Medeiros et al. 2025](https://www.pnas.org/doi/10.1073/pnas.2416637122) dated this shift separately for all 13 plankton functional groups (@fig-medeiros-s17, @tbl-medeiros-s1). Does NLA-GP find similar timing, on the full monthly time series from Lake Zurich ([Merz et al. 2023](https://www.nature.com/articles/s41558-023-01615-6))?
@@ -330,7 +392,79 @@ ggplot(long_ts, aes(date, value)) +
 - Medeiros et al.'s 3 clearest cases (lowest SS ratio: Green algae (large), Cryptophytes (small), Omnivores) are exactly the 3 groups we highlighted in earlier work; @tbl-zurich-summary shows how NLA-GP does on the full set of 13
 - NLA-GP's relative ordering of these 3 clearest groups still tracks Medeiros et al.'s (Omnivores earliest, then Green algae (large), then Cryptophytes (small))
 
+# PDO test
+
+::: {.callout-tip title="Question"}
+Huang et al. 2024 (Sec. 3.2) applied the original NLA-S-map to the Pacific Decadal Oscillation (PDO) index and detected a shift in its dynamics around 1973, using [monthly PDO data from NOAA](https://github.com/chromian/Nested-Library-Analysis/blob/main/Laboratory/data.csv) (as republished in their own analysis repository). Does NLA-GP find a similar shift, and does it agree with NLA-S-map?
+:::
+
+## Data
+
+**To answer this, we:**
+
+- Load the same monthly PDO series, and take a 12-month moving average, restricted to 1875-2000, exactly as Huang et al. 2024 describe
+- Fix the **test set to 1875-1919** (the early part) and let the **library (1920-2000) shrink from the right** -- i.e. the right check, exactly as they did
+- Compare NLA-GP and NLA-S-map's detected change point to their reported ~1973
+
+```{r pdo_functions}
+pdo <- read.csv(here("data", "raw", "pdo.csv"), skip = 1)
+pdo$year <- as.integer(substr(pdo$Date, 1, 4))
+pdo$month <- as.integer(substr(pdo$Date, 5, 6))
+pdo <- pdo[pdo$year >= 1875 & pdo$year <= 2000, ]
+pdo <- pdo[order(pdo$year, pdo$month), ]
+pdo$ma <- rollmean(pdo$Value, k = 12, fill = NA, align = "right")
+pdo <- pdo[complete.cases(pdo), ]
+pdo$idx <- seq_len(nrow(pdo))
+```
+
+```{r fig-pdo-traj}
+#| fig-cap: "Monthly PDO index (grey) and its 12-month moving average (black), 1875-2000. Shaded: the test set (before 1920)."
+L_pdo <- which.min(abs(pdo$year - 1920))
+
+ggplot(pdo, aes(year + (month - 1) / 12)) +
+  geom_rect(xmin = -Inf, xmax = pdo$year[L_pdo], ymin = -Inf, ymax = Inf, fill = "grey90", inherit.aes = FALSE) +
+  geom_line(aes(y = Value), color = "grey70", linewidth = 0.2) +
+  geom_line(aes(y = ma), linewidth = 0.6) +
+  labs(x = "Year", y = "PDO index") +
+  theme_minimal()
+```
+
+## Results
+
+We use a coarser `Dskipstep` than for Lake Zurich (24 months) since this series is much longer (1501 months); with it, each right check still takes a few minutes.
+
+```{r run_pdo}
+y_pdo <- pdo$ma
+T_pdo <- length(y_pdo)
+
+t0 <- Sys.time()
+right_pdo_gp <- nla_right(y_pdo, L = L_pdo, R = T_pdo, E = 3, tau = 1, Dskipstep = 24, bandwidth = 48)
+time_pdo_gp <- as.numeric(Sys.time() - t0, units = "secs")
+
+t0 <- Sys.time()
+right_pdo_sm <- nla_right_smap(y_pdo, L = L_pdo, R = T_pdo, E = 3, tau = 1, Dskipstep = 24, bandwidth = 48)
+time_pdo_sm <- as.numeric(Sys.time() - t0, units = "secs")
+```
+
+```{r tbl-pdo-summary}
+#| tbl-cap: "NLA-GP vs. NLA-S-map on the PDO index (right check only, as in Huang et al. 2024), vs. their reported ~1973."
+tibble(Method = c("NLA-GP", "NLA-S-map"),
+       `Detected year` = c(
+         if (is.na(right_pdo_gp$tau_hat)) NA_character_ else as.character(round(pdo$year[round(right_pdo_gp$tau_hat)])),
+         if (is.na(right_pdo_sm$tau_hat)) NA_character_ else as.character(round(pdo$year[round(right_pdo_sm$tau_hat)]))),
+       `Huang et al. 2024` = c("~1973", "~1973"),
+       `Runtime (s)` = round(c(time_pdo_gp, time_pdo_sm), 1)) %>%
+  knitr::kable()
+```
+
+**We conclude:**
+
+- NLA-GP lands closer to Huang et al.'s reported ~1973 than NLA-S-map does here -- the opposite of what we found on the synthetic food-chain benchmark, where S-map was far more accurate
+- Taken together with the food-chain result, neither method is uniformly better: which one wins seems to depend on the system, not a general property of GP-EDM vs. S-map
+- We did not reproduce Huang et al.'s original NLA-S-map result exactly (different smoothing bandwidth/step size, and their own implementation may differ from our reconstruction from S2 Text) -- treat this as a rough replication, not a precise one
+
 # Conclusion
 
 - On real Lake Zurich data (full series, all 13 functional groups, z-scored abundance): see @tbl-zurich-summary and @fig-zurich-nla-vs-medeiros for how NLA-GP compares to Medeiros et al. 2025's change-point analysis
+- On the Pacific Decadal Oscillation index (Huang et al. 2024, Sec. 3.2): NLA-GP landed closer to their reported ~1973 shift than our reconstruction of NLA-S-map did (@tbl-pdo-summary) -- the reverse of the synthetic food-chain result in `1_implement.qmd`
 - See `1_implement.qmd` for the algorithm and its validation on synthetic data with a known regime shift
