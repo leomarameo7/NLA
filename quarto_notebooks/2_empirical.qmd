@@ -1,0 +1,336 @@
+---
+title: "NLA-GP: Empirical Test"
+author: "Leonardo Capitani (leocapi07@gmail.com)"
+date: "2026-07-19"
+date-modified: last-modified
+format:
+  html:
+    css: styles.css
+    toc: true
+    code-fold: true
+    code-tools: true
+    code-link: true
+    embed-resources: true
+    crossref:
+      fig-title: "**Figure**"
+      tbl-title: "**Table**"
+      title-delim: "."
+
+execute:
+  echo: true
+  warning: false
+  message: false
+
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+```{r load_libraries}
+library(GPEDM)
+library(tidyverse)
+library(here)
+library(zoo)
+```
+
+::: callout-important
+This notebook applies **NLA-GP** to real data. See `1_implement.qmd` for the algorithm, its derivation, and validation on a synthetic system with a known regime shift. The NLA-GP implementation is reproduced below so this notebook runs standalone.
+:::
+
+## Code
+
+```{r core_functions}
+#' Gaussian-kernel smoothing of an error curve (the paper's "Gaussian filter").
+smooth_gaussian <- function(idx, y, bandwidth) {
+  keep <- is.finite(y)
+  if (sum(keep) < 3) return(rep(NA_real_, length(y)))
+  out <- rep(NA_real_, length(y))
+  xi <- idx[keep]; yi <- y[keep]
+  for (i in seq_along(idx)) {
+    w <- exp(-0.5 * ((xi - idx[i]) / bandwidth)^2)
+    out[i] <- sum(w * yi) / sum(w)
+  }
+  out
+}
+
+#' Is a (smoothed) error curve valley-shaped, and if so, where is the minimum?
+#' Discriminant (Huang et al. 2024, Sec 2.2): sign of the first difference is
+#' a single run of "-" followed by a single run of "+".
+find_valley <- function(idx, y_smooth, flat_tol = 1e-8) {
+  ok <- is.finite(y_smooth)
+  if (sum(ok) < 3) return(list(is_valley = FALSE, tau_hat = NA_real_))
+  idx <- idx[ok]; y_smooth <- y_smooth[ok]
+  o <- order(idx); idx <- idx[o]; y_smooth <- y_smooth[o]
+
+  d <- diff(y_smooth)
+  scale_ <- max(abs(y_smooth), flat_tol)
+  s <- ifelse(abs(d) < flat_tol * scale_, 0, sign(d))
+  s_nz <- s[s != 0]
+  if (length(s_nz) < 2) return(list(is_valley = FALSE, tau_hat = NA_real_))
+
+  runs <- rle(s_nz)$values
+  is_valley <- length(runs) == 2 && identical(runs, c(-1, 1))
+
+  imin <- which.min(y_smooth)
+  at_boundary <- imin == 1 || imin == length(y_smooth)
+  is_valley <- is_valley && !at_boundary
+
+  list(is_valley = is_valley, tau_hat = if (is_valley) idx[imin] else NA_real_)
+}
+
+#' Build lag/predictor columns ONCE over the full series, and z-score them
+#' ONCE using a fixed reference (see 1_implement.qmd for why).
+build_lag_frame <- function(y, E, tau) {
+  T <- length(y)
+  base <- data.frame(time = seq_len(T), y = y)
+  lagdf <- makelags(data = base, y = "y", E = E, tau = tau, append = TRUE)
+  xnames <- setdiff(names(lagdf), c("time", "y"))
+
+  complete <- stats::complete.cases(lagdf[, c("y", xnames)])
+  ymean <- mean(lagdf$y[complete]); ysd <- sd(lagdf$y[complete])
+  lagdf$y <- (lagdf$y - ymean) / ysd
+  for (xn in xnames) {
+    xmean <- mean(lagdf[[xn]][complete]); xsd <- sd(lagdf[[xn]][complete])
+    lagdf[[xn]] <- (lagdf[[xn]] - xmean) / xsd
+  }
+  list(lagdf = lagdf, xnames = xnames)
+}
+
+fit_hyperparams <- function(lagdf, xnames, lib_start, lib_end, test_rows) {
+  train <- lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, ]
+  tryCatch(
+    fitGP(data = train, y = "y", x = xnames, scaling = "none", newdata = test_rows),
+    error = function(e) NULL
+  )
+}
+
+refit_fixed <- function(lagdf, xnames, lib_start, lib_end, test_rows, fixedpars) {
+  train <- lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, ]
+  if (nrow(na.omit(train[, c("y", xnames)])) < length(xnames) + 2) return(NA_real_)
+  fit <- tryCatch(
+    fitGP(data = train, y = "y", x = xnames, scaling = "none",
+          fixedpars = fixedpars, newdata = test_rows),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(NA_real_)
+  unname(fit$outsampfitstats["rmse"])
+}
+
+#' Left check (Algorithm 1): library = y[1:L], test = y[(L+1):R].
+nla_left <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
+                      bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  lf <- build_lag_frame(y, E, tau)
+  lagdf <- lf$lagdf; xnames <- lf$xnames
+  test_rows <- lagdf[lagdf$time >= (L + 1) & lagdf$time <= R, ]
+
+  n_seq <- seq(0, L - min_lib, by = Dskipstep)
+  tau_n <- rep(NA_real_, length(n_seq))
+  curves <- vector("list", length(n_seq))
+
+  for (i in seq_along(n_seq)) {
+    n <- n_seq[i]
+    lib_start_n <- max(1, n)
+    hp <- fit_hyperparams(lagdf, xnames, lib_start_n, L, test_rows)
+    if (is.null(hp)) next
+    fixedpars <- hp$pars[seq_len(length(xnames) + 2)]
+
+    l_seq <- seq(n, L - min_lib, by = Dskipstep)
+    if (length(l_seq) < 3) next
+    err <- vapply(l_seq, function(l) {
+      refit_fixed(lagdf, xnames, max(1, l), L, test_rows, fixedpars)
+    }, numeric(1))
+
+    y_smooth <- smooth_gaussian(l_seq, err, bandwidth)
+    v <- find_valley(l_seq, y_smooth)
+    tau_n[i] <- v$tau_hat
+    curves[[i]] <- data.frame(n = n, l = l_seq, rmse = err, rmse_smooth = y_smooth)
+  }
+
+  list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE),
+       tau_n = data.frame(n = n_seq, tau_hat = tau_n),
+       curves = do.call(rbind, curves))
+}
+
+#' Right check (Algorithm 2): test = y[1:L], library = y[(L+1):R].
+nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
+                       bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  lf <- build_lag_frame(y, E, tau)
+  lagdf <- lf$lagdf; xnames <- lf$xnames
+  test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]
+
+  n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)
+  tau_n <- rep(NA_real_, length(n_seq))
+  curves <- vector("list", length(n_seq))
+
+  for (i in seq_along(n_seq)) {
+    n <- n_seq[i]
+    hp <- fit_hyperparams(lagdf, xnames, L + 1, n, test_rows)
+    if (is.null(hp)) next
+    fixedpars <- hp$pars[seq_len(length(xnames) + 2)]
+
+    l_seq <- seq(n, L + 1 + min_lib, by = -Dskipstep)
+    if (length(l_seq) < 3) next
+    err <- vapply(l_seq, function(l) {
+      refit_fixed(lagdf, xnames, L + 1, l, test_rows, fixedpars)
+    }, numeric(1))
+
+    y_smooth <- smooth_gaussian(l_seq, err, bandwidth)
+    v <- find_valley(l_seq, y_smooth)
+    tau_n[i] <- v$tau_hat
+    curves[[i]] <- data.frame(n = n, l = l_seq, rmse = err, rmse_smooth = y_smooth)
+  }
+
+  list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE),
+       tau_n = data.frame(n = n_seq, tau_hat = tau_n),
+       curves = do.call(rbind, curves))
+}
+```
+
+# Empirical test
+
+::: {.callout-tip title="Question"}
+Lake Zurich shifted from a eutrophic to an oligotrophic state in the late 1980s. [Medeiros et al. 2025](https://www.pnas.org/doi/10.1073/pnas.2416637122) dated this shift separately for all 13 plankton functional groups (@fig-medeiros-s17, @tbl-medeiros-s1). Does NLA-GP find similar timing, on the full monthly time series from Lake Zurich ([Merz et al. 2023](https://www.nature.com/articles/s41558-023-01615-6))?
+:::
+
+## Data
+
+**To answer this, we:**
+
+- Process the raw monthly counts: interpolate a handful of missing months, z-score (`scale()`) each variable
+- Use the **full** 1977-2020 series (no date restriction)
+- Run NLA-GP (left + right check) on **all 13** functional groups
+
+::: {.callout-note appearance="minimal"}
+**This section loads and processes the Lake Zurich data:**
+
+- Builds a monthly date index, interpolates a few missing months
+- Renames columns, z-scores each variable (`scale()`, no log-transform)
+- `zurich_month_index()`: year/month -> row index, for marking reference dates
+:::
+
+```{r zurich_functions}
+zurich_long_names <- c(
+  Cy = "Cyanobacteria", Gr1 = "Green algae (small)", Gr2 = "Green algae (large)",
+  Di1 = "Diatoms (small)", Di2 = "Diatoms (large)", Go1 = "Gold algae (small)",
+  Go2 = "Gold algae (large)", Cr1 = "Cryptophytes (small)", Cr2 = "Cryptophytes (large)",
+  Mi = "Mixotrophic flagellates", He = "Large herbivores", Om = "Omnivores",
+  Pr = "Invertebrate predators", temperature = "Temperature", phosphorus = "Phosphate"
+)
+
+#' Load and process the raw Lake Zurich CSV (all available months): builds a
+#' monthly time index, linearly interpolates the handful of scattered
+#' single-month gaps, and z-scores each variable.
+process_zurich_data <- function(path) {
+  z <- read.csv(path)
+  z <- z[order(z$year, z$month), ]
+  z$time_idx <- seq_len(nrow(z))
+  z$date <- as.Date(sprintf("%d-%02d-01", z$year, z$month))
+
+  plankton_vars <- setdiff(names(zurich_long_names), c("temperature", "phosphorus"))
+  for (v in c(plankton_vars, "temperature", "phosphorus")) {
+    z[[v]] <- na.approx(z[[v]], x = z$time_idx, na.rm = FALSE)
+  }
+  z <- z[complete.cases(z[, plankton_vars]), ]
+
+  for (v in plankton_vars) {
+    z[[paste0("scaled_", v)]] <- as.numeric(scale(z[[v]]))
+  }
+  z$time_idx <- seq_len(nrow(z))
+  rownames(z) <- NULL
+  z
+}
+
+#' Row index closest to a given year-month, for marking reference dates.
+zurich_month_index <- function(z, year, month) {
+  target <- as.Date(sprintf("%d-%02d-01", year, month))
+  which.min(abs(z$date - target))
+}
+
+z <- process_zurich_data(here("data", "raw", "lake_zurich.csv"))
+```
+
+![This figure was made by Medeiros et al. 2025 (their Fig. S17). Monthly time series for all 13 plankton functional groups (in ind/l), phosphate concentration (in mg/l), and water temperature (in Celsius) from Lake Zurich between January 1978 and December 2019. As explained in the Materials and Methods section in the main text, Medeiros et al. 2025 performed a change-point analysis to determine the location of a potential tipping point for each functional group independently. This potential tipping point is shown for each functional group as a black dashed line and Table S1 gives additional information.](figures/Fig.S17_Medeiros_2025.png){#fig-medeiros-s17}
+
+```{r tbl-medeiros-s1}
+#| tbl-cap: "Medeiros et al. 2025, Table S1: change-point analysis for all 13 Lake Zurich functional groups. SS ratio: lower means stronger evidence of a shift (the 3 lowest are their clearest cases)."
+table_s1 <- tribble(
+  ~code, ~Group,                     ~`TP month`, ~`SS ratio`, ~Phosphate,
+  "Cr2", "Cryptophytes (large)",      "1996-02",    0.940,       0.024,
+  "Cr1", "Cryptophytes (small)",      "1988-10",    0.855,       0.043,
+  "Cy",  "Cyanobacteria",             "1986-06",    0.991,       0.055,
+  "Di2", "Diatoms (large)",           "2006-08",    0.976,       0.023,
+  "Di1", "Diatoms (small)",           "1996-06",    0.961,       0.023,
+  "Go2", "Gold algae (large)",        "1987-06",    0.961,       0.049,
+  "Go1", "Gold algae (small)",        "1996-03",    0.989,       0.024,
+  "Gr2", "Green algae (large)",       "1987-11",    0.853,       0.047,
+  "Gr1", "Green algae (small)",       "1988-06",    0.996,       0.043,
+  "Pr",  "Invertebrate predators",    "1989-10",    0.995,       0.046,
+  "He",  "Large herbivores",          "1992-10",    0.980,       0.035,
+  "Mi",  "Mixotrophic flagellates",   "1996-03",    0.931,       0.024,
+  "Om",  "Omnivores",                 "1986-06",    0.903,       0.055
+)
+table_s1 %>% select(-code) %>% arrange(`SS ratio`) %>% knitr::kable()
+```
+
+## Results
+
+```{r run_zurich_all}
+E <- 3; tau <- 1; Dskipstep <- 16; bandwidth <- 32
+L_left <- 200; L_right <- 60
+T_z <- nrow(z)
+
+zurich_results <- pmap(table_s1, function(code, Group, `TP month`, `SS ratio`, Phosphate) {
+  y <- z[[paste0("scaled_", code)]]
+  ym <- as.integer(strsplit(`TP month`, "-")[[1]])
+  ref_idx <- zurich_month_index(z, ym[1], ym[2])
+  left <- nla_left(y, L = L_left, R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+  right <- nla_right(y, L = L_right, R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+  combined <- median(c(left$tau_hat, right$tau_hat), na.rm = TRUE)
+  tibble(code = code, Group = Group, `Medeiros date` = `TP month`, `SS ratio` = `SS ratio`,
+         `NLA-GP left` = left$tau_hat, `NLA-GP right` = right$tau_hat,
+         `NLA-GP combined` = combined,
+         `NLA-GP date` = if (is.na(combined)) NA_character_ else format(z$date[round(combined)], "%Y-%m"))
+})
+```
+
+```{r tbl-zurich-summary}
+#| tbl-cap: "NLA-GP detected change points vs. Medeiros et al. 2025 (Table S1), all 13 Lake Zurich functional groups, using the full 1977-2020 series and z-scored (not log-transformed) abundance."
+zurich_summary <- bind_rows(zurich_results) %>% arrange(`SS ratio`)
+knitr::kable(zurich_summary %>% select(-code))
+```
+
+```{r fig-zurich-nla-vs-medeiros}
+#| fig-cap: "Lake Zurich functional groups (z-scored abundance) with Medeiros et al. 2025's change point (red) and NLA-GP's combined estimate (blue)."
+#| fig-height: 12
+long_ts <- z %>%
+  select(date, starts_with("scaled_")) %>%
+  pivot_longer(-date, names_to = "code", values_to = "value") %>%
+  mutate(code = str_remove(code, "^scaled_")) %>%
+  left_join(table_s1 %>% select(code, Group), by = "code")
+
+lines_df <- zurich_summary %>%
+  mutate(medeiros_date = as.Date(paste0(`Medeiros date`, "-01")),
+         nla_date = if_else(is.na(`NLA-GP date`), as.Date(NA), as.Date(paste0(`NLA-GP date`, "-01"))))
+
+ggplot(long_ts, aes(date, value)) +
+  geom_line(linewidth = 0.3, color = "grey30") +
+  geom_vline(data = lines_df, aes(xintercept = medeiros_date, color = "Medeiros"), linetype = "dashed") +
+  geom_vline(data = lines_df %>% filter(!is.na(nla_date)),
+             aes(xintercept = nla_date, color = "NLA-GP"), linetype = "dashed") +
+  facet_wrap(~Group, ncol = 3, scales = "free_y") +
+  scale_color_manual(values = c(Medeiros = "firebrick", `NLA-GP` = "steelblue"), name = NULL) +
+  labs(x = NULL, y = "z-scored abundance") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+**We conclude:**
+
+- Absolute timing differs from Medeiros et al.'s dates for most groups (@fig-zurich-nla-vs-medeiros) -- we would *not* claim precise agreement on the calendar date
+- Medeiros et al.'s 3 clearest cases (lowest SS ratio: Green algae (large), Cryptophytes (small), Omnivores) are exactly the 3 groups we highlighted in earlier work; @tbl-zurich-summary shows how NLA-GP does on the full set of 13
+- NLA-GP's relative ordering of these 3 clearest groups still tracks Medeiros et al.'s (Omnivores earliest, then Green algae (large), then Cryptophytes (small))
+
+# Conclusion
+
+- On real Lake Zurich data (full series, all 13 functional groups, z-scored abundance): see @tbl-zurich-summary and @fig-zurich-nla-vs-medeiros for how NLA-GP compares to Medeiros et al. 2025's change-point analysis
+- See `1_implement.qmd` for the algorithm and its validation on synthetic data with a known regime shift

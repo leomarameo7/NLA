@@ -51,11 +51,19 @@ library(zoo)
 
 ## Background
 
-::: callout-note
-NLA answers one question:
+Regime shifts -- abrupt transitions between alternative ecosystem states -- have been documented across marine, freshwater, and terrestrial systems, often with lasting ecological and economic consequences (Scheffer et al. 2001). Because these transitions are difficult to reverse, correctly identifying when one occurred is central to managing the systems they affect (Folke et al. 2004). Huang et al. 2024 developed Nested-Library Analysis (NLA) to close a specific gap in how such transitions are detected.
 
-> Does a time series show a change point (regime shift)?
+::: callout-note
+Can we detect when a system's underlying dynamics fundamentally changed -- a true regime shift -- rather than just when its surface statistics (mean, variance, distribution) changed?
 :::
+
+Existing change-point methods largely detect shifts in statistical properties of the data, but a generic detection method with theoretical linkage to underlying dynamics has been lacking. This distinction matters because in chaotic systems, a real shift in the governing dynamics can be concealed by the dynamics themselves -- the raw numbers can look statistically similar before and after a shift even though the attractor generating them has actually changed shape.
+
+Since regime shifts can be framed as transitions between alternative attractors (Scheffer & Carpenter 2003), and since Takens' theorem guarantees that an attractor can be reconstructed from time-delayed coordinates of just one observed variable (Takens 1981), the method turns detection into a forecasting question: if we hold out the most recent stretch of the series as a test set and progressively chop data off the far (older) end of the "library" used to reconstruct the attractor, at what cutoff does forecast skill stop improving -- or start improving -- the most?
+
+NLA fixes one end of the time series as a test set to evaluate out-of-sample forecast skill, and repeatedly removes data from the other end, originally using S-map based EDM forecasting.
+
+The logic: if the whole series comes from one stable regime, throwing more historical data into the library should generally help reconstruct the attractor and improve prediction. But if part of that history actually belongs to a different attractor (a prior regime), including it corrupts the reconstruction and forecast skill degrades. So the point where trimming old data maximally improves forecast skill is taken as the change point -- NLA determines the time of a regime shift as the cutting point at which sequential reduction of the library set optimizes the forecast skill of EDM.
 
 How it works:
 
@@ -278,99 +286,113 @@ nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
 # Synthetic test
 
 ::: {.callout-tip title="Question"}
-Take a system simple enough to know, exactly, when and why a regime shift happens. Does NLA-GP find it -- and does it do so more accurately, or faster, than the original NLA-S-map?
+Take a system where we know, exactly, when and why a regime shift happens -- and where the shift is *not* obvious in every variable. Does NLA-GP find it -- and does it do so more accurately, or faster, than the original NLA-S-map?
 :::
 
 ## Setup
 
 **To answer this, we:**
 
-- Simulate a 2-species predator-prey model (Rosenzweig-MacArthur)
-- Slowly ramp its carrying capacity `K` from 2 to 4
-- This crosses a textbook bifurcation ("paradox of enrichment") at `K = 3`: the system shifts from a stable equilibrium to a growing limit cycle -- exactly halfway through the series
-- Run NLA-GP and NLA-S-map (left and right check, both) on the prey series, and compare
+- Simulate Huang et al. 2024's own validation system (their Sec. 3.1): a 3-species food chain ([Hastings & Powell 1991](https://doi.org/10.2307/1940591)) whose vital rates are coupled to a slowly-forced nutrient resource `N`
+- `N`'s forcing crosses a fold bifurcation partway through the series, which abruptly changes the food chain's dynamics -- from chaotic to near-periodic
+- Following Huang et al. 2024, run NLA on the variable `y`, which (like their `x`) shows **no obvious shift by eye** despite depending directly on `N`
+- Repeat many times (Huang et al. 2024 used 200 replicates) and compare how often NLA-GP and NLA-S-map recover the known change point
 
 ::: {.callout-note appearance="minimal"}
-**This section simulates the synthetic benchmark:**
+**This section simulates the food-chain benchmark:**
 
-- 2-species predator-prey model with a slowly ramped carrying capacity
-- Adds process noise (random shocks) and measurement noise
-- `true_changepoint()`: the known bifurcation time, to score both methods against
+- Nutrient resource `N`, forced across a fold bifurcation (as in our earlier synthetic test)
+- 3-species food chain `x -> y -> z`, whose mortality/attack-rate parameters depend on `N`
+- Adds process noise (random shocks) and measurement noise, as Huang et al. 2024 describe
 :::
 
-```{r regime_shift_functions}
-# dV/dt = r V (1 - V/K) - a V P / (1 + a h V)
-# dP/dt = e a V P / (1 + a h V) - m P
-# K(t)  = K_lo + (K_hi - K_lo) * t / Tmax
-#
-# With r=1, a=1.1, h=0.8, e=0.7, m=0.4 (textbook values), the coexistence
-# equilibrium is stable for K < K_crit = 3.0 and unstable (-> limit cycle)
-# above it (found by bisection on simulated oscillation amplitude).
-# Ramping K from 2.0 to 4.0 crosses K_crit exactly halfway through.
+The model (Huang et al. 2024, eq. 3-4; parameters in their S3 Text, Table A):
 
-rm_rhs <- function(t, state, params) {
+$$
+\dot N = a(t) - bN + \frac{cN^m}{N^m+1}, \qquad a(t) = c_4 t + c_5
+$$
+
+$$
+\dot x = x(1-x) - f_1(x)y, \qquad \dot y = -d_1 y + f_1(x)y - f_2(y)z, \qquad \dot z = -d_2 z + f_2(y)z
+$$
+
+$$
+f_i(u) = \frac{p_i u}{1+q_i u}, \qquad d_1 = c_0 N + c_1, \qquad p_1 = c_2 N + c_3
+$$
+
+`x -> y -> z` is exactly the classic Hastings & Powell (1991) chaotic food chain (Huang et al. 2024 cite it directly as their eq. 3 source), reparameterized so that `y`'s mortality (`d_1`) and `x`'s attack rate (`p_1`) both increase with the nutrient resource `N`.
+
+::: callout-warning
+**On reproducing Huang et al.'s exact parameters:** `b=0.8, m=8, c=1` (the `N` subsystem), `q1=3.25, p2=0.1, q2=2, d2=0.01`, and `c2=0.05` come directly from their S3 Text parameter table and check out numerically. Two values did not:
+
+- **`d1`'s and `p1`'s baselines appear swapped in the table as extracted.** With `d1` baseline `3.7` and `p1` baseline `0.4`, `p1/q1`'s maximum possible value (~0.13) is always far below `d1`'s minimum, so `y` (and hence `z`) goes extinct from every initial condition we tried, regardless of `N` (verified numerically). Since `x -> y -> z` is explicitly the Hastings & Powell (1991) model, whose well-known chaotic regime uses mortality `m=0.4` and attack rate `a=5`, we swapped the two extracted baselines (`c1=0.4` for `d1`, `c3=3.7` for `p1`) -- this reproduces exactly the expected chaotic food chain.
+- **`c0` (how strongly `N` drives up `d1`) needed to be smaller than extracted (`0.75`)** to keep the food chain oscillating (rather than collapsing to extinction) across `N`'s full range; we use `0.15`.
+
+We flag this rather than silently presenting these as the published values.
+:::
+
+```{r foodchain_functions}
+foodchain_rhs <- function(t, state, params) {
   with(as.list(c(state, params)), {
-    K <- K_lo + (K_hi - K_lo) * t / Tmax
-    dV <- r * V * (1 - V / K) - a * V * P / (1 + a * h * V)
-    dP <- e * a * V * P / (1 + a * h * V) - m * P
-    list(c(V = dV, P = dP))
+    a  <- c4 * t + c5
+    d1 <- c0 * N + c1
+    p1 <- c2 * N + c3
+    dN <- a - b * N + c * N^m / (N^m + 1)
+    dx <- x * (1 - x) - p1 * x * y / (1 + q1 * x)
+    dy <- -d1 * y + p1 * x * y / (1 + q1 * x) - p2 * y * z / (1 + q2 * y)
+    dz <- -d2 * z + p2 * y * z / (1 + q2 * y)
+    list(c(N = dN, x = dx, y = dy, z = dz))
   })
 }
 
-default_rm_params <- function(K_lo = 2, K_hi = 4, Tmax = 500) {
-  list(r = 1, a = 1.1, h = 0.8, e = 0.7, m = 0.4, K_lo = K_lo, K_hi = K_hi, Tmax = Tmax)
+default_fc_params <- function(c4 = 0.000867, c5 = 0.25) {
+  list(b = 0.8, m = 8, c = 1, d2 = 0.01, c0 = 0.15, c1 = 0.4,
+       c2 = 0.05, c3 = 3.7, q1 = 3.25, p2 = 0.1, q2 = 2, c4 = c4, c5 = c5)
 }
 
-#' Simulate the model with Poisson-arrival process shocks and Gaussian
-#' measurement noise.
-simulate_regime_shift <- function(Tmax = 500, dt_sample = 1, lambda = 0.01,
-                                   rho = 0.05, meas_sd = 0.02,
-                                   params = default_rm_params(Tmax = Tmax),
-                                   seed = 1) {
+#' Simulate the food chain, with Poisson-arrival process shocks and Gaussian
+#' measurement noise (Huang et al. 2024, S3 Text).
+simulate_foodchain <- function(Tmax = 1000, dt_sample = 1, lambda = 0.01, rho = 0.05,
+                                meas_sd = 0.05, state0 = c(N = 0.3, x = 0.5, y = 0.1, z = 9),
+                                params = default_fc_params(), seed = 1) {
   set.seed(seed)
   n_events <- rpois(1, lambda * Tmax)
   event_times <- sort(runif(n_events, 1e-6, Tmax - 1e-6))
-  shocks <- matrix(runif(2 * n_events, 1 - rho, 1 + rho), ncol = 2)
+  shocks <- matrix(runif(4 * n_events, 1 - rho, 1 + rho), ncol = 4)
   event_func <- function(t, state, params) {
     i <- which(abs(event_times - t) < 1e-6)[1]
-    if (!is.na(i)) state <- pmax(state * shocks[i, ], 1e-6)
+    if (!is.na(i)) state <- pmax(state * shocks[i, ], 1e-8)
     state
   }
-
   samp_times <- seq(0, Tmax, by = dt_sample)
-  sol <- ode(y = c(V = 1, P = 0.5), times = samp_times, func = rm_rhs, parms = params,
-             method = "ode45",
+  sol <- ode(y = state0, times = samp_times, func = foodchain_rhs, parms = params, method = "ode45",
              events = if (n_events > 0) list(func = event_func, time = event_times) else NULL)
   traj <- as.data.frame(sol)
   traj <- traj[complete.cases(traj), ]
-
-  traj$K <- with(params, K_lo + (K_hi - K_lo) * traj$time / Tmax)
-  for (v in c("V", "P")) {
-    traj[[v]] <- scale(traj[[v]])[, 1] + rnorm(nrow(traj), 0, meas_sd)
-  }
+  for (v in c("N", "x", "y", "z")) traj[[v]] <- scale(traj[[v]])[, 1] + rnorm(nrow(traj), 0, meas_sd)
   rownames(traj) <- NULL
   traj
 }
 
-#' True change-point index: the row where K(t) crosses K_crit.
-true_changepoint <- function(traj, K_crit = 3.0) {
-  which.min(abs(traj$K - K_crit))
-}
+# The forcing a(t) = c4*t + c5 crosses the N subsystem's fold bifurcation
+# (at a ~ 0.51) at t = 300, matching Huang et al. 2024's own choice of
+# change point (they crop a 1000-step window so this always lands at
+# t=300); c4 is derived for this, not taken from the (implausible, as
+# extracted: it would sweep a past 1800) supplementary value.
+cp_true <- 300
 ```
 
-```{r fig-synthetic-traj}
-#| fig-cap: "Simulated regime shift: prey abundance V (top) shifts from a stable equilibrium to a growing limit cycle exactly when carrying capacity K (bottom) crosses the bifurcation threshold (blue dotted line)."
-traj <- simulate_regime_shift(seed = 1)
-cp_true <- true_changepoint(traj)
+```{r fig-foodchain-traj}
+#| fig-cap: "One simulated realization (Fig 2-style): z, y, x each depend directly on N, but only z visibly shifts in mean; the shift in x and y is a change in dynamical character (chaotic to near-periodic), not visible by eye. Dashed line: true change point (t=300)."
+traj <- simulate_foodchain(seed = 1)
 
 traj %>%
-  select(time, V, K) %>%
+  select(time, z, y, x, N) %>%
   pivot_longer(-time, names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(variable, levels = c("z", "y", "x", "N"))) %>%
   ggplot(aes(time, value)) +
   geom_line() +
-  geom_vline(xintercept = traj$time[cp_true], linetype = "dashed", color = "firebrick") +
-  geom_hline(data = tibble(variable = "K", value = 3), aes(yintercept = value),
-             linetype = "dotted", color = "steelblue") +
+  geom_vline(xintercept = cp_true, linetype = "dashed", color = "firebrick") +
   facet_wrap(~variable, ncol = 1, scales = "free_y") +
   labs(x = "Time", y = NULL) +
   theme_minimal()
@@ -378,19 +400,24 @@ traj %>%
 
 ## GP result
 
+We first demonstrate NLA-GP on a single realization, cropping to a window around the shift for tractability (`t` in `[100, 600]`, so `cp_true` is at crop-index 201).
+
 ```{r run_synthetic_gp}
-E <- 3; tau <- 1; Dskipstep <- 8; bandwidth <- 16
-T_syn <- nrow(traj)
-y_syn <- traj$V
+E <- 3; tau <- 1; Dskipstep <- 15; bandwidth <- 30
+crop <- traj[traj$time >= 100 & traj$time <= 600, ]
+T_syn <- nrow(crop)
+cp_true_crop <- cp_true - 99
+y_syn <- crop$y
+L_left <- round(T_syn * 0.65); L_right <- round(T_syn * 0.35)
 
 t0 <- Sys.time()
-left_gp  <- nla_left(y_syn,  L = 350, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
-right_gp <- nla_right(y_syn, L = 150, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+left_gp  <- nla_left(y_syn,  L = L_left, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+right_gp <- nla_right(y_syn, L = L_right, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
 time_gp <- as.numeric(Sys.time() - t0, units = "secs")
 combined_gp <- median(c(left_gp$tau_hat, right_gp$tau_hat), na.rm = TRUE)
 
 tibble(estimate = c("True change point", "Left check", "Right check", "Combined"),
-       value = c(cp_true, left_gp$tau_hat, right_gp$tau_hat, combined_gp))
+       value = c(cp_true_crop, left_gp$tau_hat, right_gp$tau_hat, combined_gp))
 ```
 
 ```{r fig-synthetic-curves}
@@ -401,7 +428,7 @@ right_gp$curves %>%
   ggplot(aes(l, rmse)) +
   geom_point(color = "grey60", size = 1) +
   geom_line(aes(y = rmse_smooth), color = "steelblue", linewidth = 0.8) +
-  geom_vline(xintercept = traj$time[cp_true], linetype = "dashed", color = "firebrick") +
+  geom_vline(xintercept = cp_true_crop, linetype = "dashed", color = "firebrick") +
   facet_wrap(~n, labeller = label_both) +
   labs(x = "Library start l", y = "Out-of-sample RMSE") +
   theme_minimal()
@@ -497,162 +524,105 @@ nla_right_smap <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
 
 ```{r run_synthetic_smap}
 t0 <- Sys.time()
-left_sm  <- nla_left_smap(y_syn,  L = 350, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
-right_sm <- nla_right_smap(y_syn, L = 150, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+left_sm  <- nla_left_smap(y_syn,  L = L_left, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+right_sm <- nla_right_smap(y_syn, L = L_right, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
 time_sm <- as.numeric(Sys.time() - t0, units = "secs")
 combined_sm <- median(c(left_sm$tau_hat, right_sm$tau_hat), na.rm = TRUE)
 
 tibble(estimate = c("True change point", "Left check", "Right check", "Combined"),
-       value = c(cp_true, left_sm$tau_hat, right_sm$tau_hat, combined_sm))
+       value = c(cp_true_crop, left_sm$tau_hat, right_sm$tau_hat, combined_sm))
 ```
 
-## Comparison
-
-```{r tbl-synthetic-comparison}
-#| tbl-cap: "NLA-GP vs. NLA-S-map on the synthetic benchmark: accuracy and runtime."
+```{r tbl-synthetic-single}
+#| tbl-cap: "NLA-GP vs. NLA-S-map on this single realization: accuracy and runtime."
 tibble(Method = c("NLA-GP", "NLA-S-map"),
        `Left check` = c(left_gp$tau_hat, left_sm$tau_hat),
        `Right check` = c(right_gp$tau_hat, right_sm$tau_hat),
        Combined = c(combined_gp, combined_sm),
-       `Error (vs. true)` = round(abs(c(combined_gp, combined_sm) - cp_true)),
+       `Error (vs. true)` = round(abs(c(combined_gp, combined_sm) - cp_true_crop)),
        `Runtime (s)` = round(c(time_gp, time_sm), 1)) %>%
   knitr::kable()
 ```
 
-**We conclude:**
+## Comparison
 
-- **Right check** (test set = early, library shrinks from the late end): both methods find a clear valley, close to the true change point
-- **Left check** (test set = late, library shrinks from the early end): NLA-S-map finds a valley here too; NLA-GP does not, because `K` drifts continuously -- more recent library data is always a bit more relevant regardless of the bifurcation, which masks the sharp before/after contrast the left check looks for
-- On this benchmark, **NLA-S-map beats NLA-GP on both counts**: its combined estimate is closer to the true change point (error 12 vs. 28), and it runs faster (25.8s vs. 42.2s, @tbl-synthetic-comparison) -- the two-stage GP fitting trick pays off when hyperparameter search is the bottleneck, but for a low-dimensional system like this one, S-map's much simpler theta-search is already fast *and* it succeeded on both checks instead of one
-- Takeaway: NLA-GP's real advantage is expected to show up on **more complex, higher-dimensional, or noisier** systems where GP-EDM's flexibility should out-predict a fixed-form local-linear model -- not necessarily on simple textbook cases like this one
+A single realization isn't a reliable performance measure (Huang et al. 2024 use 200 replicates, Fig 4). We repeat the simulation with different noise draws and score both methods over many replicates.
 
-# Empirical test
-
-::: {.callout-tip title="Question"}
-Lake Zurich shifted from a eutrophic to an oligotrophic state in the late 1980s. [Medeiros et al. 2025](https://www.pnas.org/doi/10.1073/pnas.2416637122) dated this shift separately for all 13 plankton functional groups (@fig-medeiros-s17, @tbl-medeiros-s1). Does NLA-GP find similar timing, on the full monthly time series from Lake Zurich ([Merz et al. 2023](https://www.nature.com/articles/s41558-023-01615-6))?
+::: callout-note
+**Compute:** we use 20 replicates, not 200 -- each replicate takes ~25-40s for both methods combined, so 200 would take over 2 hours. This is far fewer than Huang et al. 2024 used, so treat the resulting distributions as indicative, not a precise reproduction of their Fig 4.
 :::
 
-## Data
+```{r run_replicates}
+N_REPLICATES <- 20
 
-**To answer this, we:**
+run_one_replicate <- function(seed) {
+  tr <- simulate_foodchain(seed = seed)
+  cr <- tr[tr$time >= 100 & tr$time <= 600, ]
+  y <- cr$y
+  Tn <- nrow(cr)
+  Ll <- round(Tn * 0.65); Lr <- round(Tn * 0.35)
 
-- Process the raw monthly counts: interpolate a handful of missing months, z-score (`scale()`) each variable
-- Use the **full** 1977-2020 series (no date restriction)
-- Run NLA-GP (left + right check) on **all 13** functional groups
+  lg <- nla_left(y,  L = Ll, R = Tn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+  rg <- nla_right(y, L = Lr, R = Tn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+  ls <- nla_left_smap(y,  L = Ll, R = Tn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+  rs <- nla_right_smap(y, L = Lr, R = Tn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
 
-::: {.callout-note appearance="minimal"}
-**This section loads and processes the Lake Zurich data:**
-
-- Builds a monthly date index, interpolates a few missing months
-- Renames columns, z-scores each variable (`scale()`, no log-transform)
-- `zurich_month_index()`: year/month -> row index, for marking reference dates
-:::
-
-```{r zurich_functions}
-zurich_long_names <- c(
-  Cy = "Cyanobacteria", Gr1 = "Green algae (small)", Gr2 = "Green algae (large)",
-  Di1 = "Diatoms (small)", Di2 = "Diatoms (large)", Go1 = "Gold algae (small)",
-  Go2 = "Gold algae (large)", Cr1 = "Cryptophytes (small)", Cr2 = "Cryptophytes (large)",
-  Mi = "Mixotrophic flagellates", He = "Large herbivores", Om = "Omnivores",
-  Pr = "Invertebrate predators", temperature = "Temperature", phosphorus = "Phosphate"
-)
-
-#' Load and process the raw Lake Zurich CSV (all available months): builds a
-#' monthly time index, linearly interpolates the handful of scattered
-#' single-month gaps, and z-scores each variable.
-process_zurich_data <- function(path) {
-  z <- read.csv(path)
-  z <- z[order(z$year, z$month), ]
-  z$time_idx <- seq_len(nrow(z))
-  z$date <- as.Date(sprintf("%d-%02d-01", z$year, z$month))
-
-  plankton_vars <- setdiff(names(zurich_long_names), c("temperature", "phosphorus"))
-  for (v in c(plankton_vars, "temperature", "phosphorus")) {
-    z[[v]] <- na.approx(z[[v]], x = z$time_idx, na.rm = FALSE)
-  }
-  z <- z[complete.cases(z[, plankton_vars]), ]
-
-  for (v in plankton_vars) {
-    z[[paste0("scaled_", v)]] <- as.numeric(scale(z[[v]]))
-  }
-  z$time_idx <- seq_len(nrow(z))
-  rownames(z) <- NULL
-  z
+  tibble(seed = seed,
+         `NLA-GP` = median(c(lg$tau_hat, rg$tau_hat), na.rm = TRUE),
+         `NLA-S-map` = median(c(ls$tau_hat, rs$tau_hat), na.rm = TRUE))
 }
 
-#' Row index closest to a given year-month, for marking reference dates.
-zurich_month_index <- function(z, year, month) {
-  target <- as.Date(sprintf("%d-%02d-01", year, month))
-  which.min(abs(z$date - target))
-}
-
-z <- process_zurich_data(here("data", "raw", "lake_zurich.csv"))
+replicate_results <- map_dfr(seq_len(N_REPLICATES), run_one_replicate)
+replicate_long <- replicate_results %>%
+  pivot_longer(-seed, names_to = "Method", values_to = "tau_hat")
 ```
 
-![This figure was made by Medeiros et al. 2025 (their Fig. S17). Monthly time series for all 13 plankton functional groups (in ind/l), phosphate concentration (in mg/l), and water temperature (in Celsius) from Lake Zurich between January 1978 and December 2019. As explained in the Materials and Methods section in the main text, Medeiros et al. 2025 performed a change-point analysis to determine the location of a potential tipping point for each functional group independently. This potential tipping point is shown for each functional group as a black dashed line and Table S1 gives additional information.](figures/Fig.S17_Medeiros_2025.png){#fig-medeiros-s17}
-
-```{r tbl-medeiros-s1}
-#| tbl-cap: "Medeiros et al. 2025, Table S1: change-point analysis for all 13 Lake Zurich functional groups. SS ratio: lower means stronger evidence of a shift (the 3 lowest are their clearest cases)."
-table_s1 <- tribble(
-  ~code, ~Group,                     ~`TP month`, ~`SS ratio`, ~Phosphate,
-  "Cr2", "Cryptophytes (large)",      "1996-02",    0.940,       0.024,
-  "Cr1", "Cryptophytes (small)",      "1988-10",    0.855,       0.043,
-  "Cy",  "Cyanobacteria",             "1986-06",    0.991,       0.055,
-  "Di2", "Diatoms (large)",           "2006-08",    0.976,       0.023,
-  "Di1", "Diatoms (small)",           "1996-06",    0.961,       0.023,
-  "Go2", "Gold algae (large)",        "1987-06",    0.961,       0.049,
-  "Go1", "Gold algae (small)",        "1996-03",    0.989,       0.024,
-  "Gr2", "Green algae (large)",       "1987-11",    0.853,       0.047,
-  "Gr1", "Green algae (small)",       "1988-06",    0.996,       0.043,
-  "Pr",  "Invertebrate predators",    "1989-10",    0.995,       0.046,
-  "He",  "Large herbivores",          "1992-10",    0.980,       0.035,
-  "Mi",  "Mixotrophic flagellates",   "1996-03",    0.931,       0.024,
-  "Om",  "Omnivores",                 "1986-06",    0.903,       0.055
-)
-table_s1 %>% select(-code) %>% arrange(`SS ratio`) %>% knitr::kable()
+```{r tbl-replicate-summary}
+#| tbl-cap: "NLA-GP vs. NLA-S-map across replicate simulations: detection rate, median estimate, and error relative to the true change point (crop-index 201)."
+replicate_long %>%
+  group_by(Method) %>%
+  summarise(`Detected (n)` = sum(!is.na(tau_hat)),
+            `Detected (%)` = round(100 * mean(!is.na(tau_hat))),
+            `Median estimate` = median(tau_hat, na.rm = TRUE),
+            `Median error` = median(abs(tau_hat - cp_true_crop), na.rm = TRUE),
+            .groups = "drop") %>%
+  knitr::kable()
 ```
 
-## Results
-
-```{r run_zurich_all}
-E <- 3; tau <- 1; Dskipstep <- 16; bandwidth <- 32
-L_left <- 200; L_right <- 60
-T_z <- nrow(z)
-
-zurich_results <- pmap(table_s1, function(code, Group, `TP month`, `SS ratio`, Phosphate) {
-  y <- z[[paste0("scaled_", code)]]
-  ym <- as.integer(strsplit(`TP month`, "-")[[1]])
-  ref_idx <- zurich_month_index(z, ym[1], ym[2])
-  left <- nla_left(y, L = L_left, R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
-  right <- nla_right(y, L = L_right, R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
-  combined <- median(c(left$tau_hat, right$tau_hat), na.rm = TRUE)
-  tibble(Group = Group, `Medeiros date` = `TP month`, `SS ratio` = `SS ratio`,
-         `NLA-GP left` = left$tau_hat, `NLA-GP right` = right$tau_hat,
-         `NLA-GP combined` = combined,
-         `NLA-GP date` = if (is.na(combined)) NA_character_ else format(z$date[round(combined)], "%Y-%m"))
-})
+```{r fig-replicate-density}
+#| fig-cap: "Distribution of detected change points across replicates (Fig 4-style, left panel). Dashed red: true change point."
+ggplot(replicate_long %>% filter(!is.na(tau_hat)), aes(tau_hat, fill = Method)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 15) +
+  geom_vline(xintercept = cp_true_crop, linetype = "dashed", color = "firebrick") +
+  labs(x = "Detected change point", y = "Count") +
+  theme_minimal()
 ```
 
-```{r tbl-zurich-summary}
-#| tbl-cap: "NLA-GP detected change points vs. Medeiros et al. 2025 (Table S1), all 13 Lake Zurich functional groups, using the full 1977-2020 series and z-scored (not log-transformed) abundance."
-zurich_summary <- bind_rows(zurich_results) %>% arrange(`SS ratio`)
-knitr::kable(zurich_summary)
+```{r fig-replicate-ecdf}
+#| fig-cap: "Empirical cumulative distribution of detected change points (Fig 4-style, right panel). Dashed red: true change point."
+ggplot(replicate_long %>% filter(!is.na(tau_hat)), aes(tau_hat, color = Method)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_vline(xintercept = cp_true_crop, linetype = "dashed", color = "firebrick") +
+  labs(x = "Detected change point", y = "Cumulative count (fraction)") +
+  theme_minimal()
 ```
 
 **We conclude:**
 
-- Absolute timing differs from Medeiros et al.'s dates for most groups -- we would *not* claim precise agreement on the calendar date
-- Medeiros et al.'s 3 clearest cases (lowest SS ratio: Green algae (large), Cryptophytes (small), Omnivores) are exactly the 3 groups we highlighted earlier; @tbl-zurich-summary shows how NLA-GP does on the full set of 13
-- Consistent with our earlier (3-group) finding, NLA-GP's relative ordering of these 3 clearest groups still tracks Medeiros et al.'s
+- Both methods detect *a* change point in most replicates (NLA-S-map: 20/20; NLA-GP: 19/20, @tbl-replicate-summary), but **NLA-S-map is substantially more accurate**: its median error is 11 (index units), against 109 for NLA-GP -- an order of magnitude apart, not noise
+- @fig-replicate-density and @fig-replicate-ecdf show why: NLA-S-map's estimates cluster tightly around the true change point, while NLA-GP's are detected almost as often but scattered far more widely
+- This is the opposite of what we expected going in (that GP-EDM's flexibility should help on a genuinely chaotic system). One plausible reason: this food chain's attractor is thin and fast-changing, so a squared-exponential GP kernel fit from a modest library may struggle to track it as precisely as S-map's simpler, more local linear approximation -- worth checking with a larger `E` or more library data before concluding GP-EDM is worse here in general
+- Takeaway: **on this benchmark, NLA-GP does not outperform the original NLA-S-map** -- if anything, the reverse. Any claim that GP-EDM improves NLA needs to be demonstrated on a system where it actually wins, not assumed
 
 # Conclusion
 
 - Implemented NLA-GP: Huang et al. 2024's NLA algorithm with GP-EDM instead of S-map (two-stage fitting, per Munch & Rogers)
-- On a synthetic system with a **known** regime shift: NLA-GP's right check recovers it closely; its left check fails when the underlying parameter drifts continuously. NLA-S-map matched or beat NLA-GP on both accuracy and runtime on this simple benchmark
-- On **real** Lake Zurich data (full series, all 13 groups, z-scored abundance): see @tbl-zurich-summary for how NLA-GP compares to Medeiros et al. 2025's change-point analysis
+- Validated on Huang et al. 2024's own food-chain benchmark (a known regime shift, hidden from `x` and `y` by eye): both methods detect a change point in nearly all replicates, but NLA-S-map is markedly more accurate (median error 11 vs. 109) -- NLA-GP did not outperform the original method here
+- See `2_empirical.qmd` for NLA-GP applied to real data (Lake Zurich plankton, all 13 functional groups) and compared against Medeiros et al. 2025's independent change-point analysis
 
 ## Next
 
+- Investigate *why* NLA-GP underperformed NLA-S-map here: try larger `E`, more library data per fit, or a longer (less compute-constrained) library/test split
 - Sensitivity analysis over `E`, `tau`, `Dskipstep`, and the smoothing bandwidth (we used one reasonable default throughout, not a tuned choice)
-- Test NLA-GP vs. NLA-S-map on a higher-dimensional or noisier synthetic system, where GP-EDM's flexibility should matter more
+- Run the full 200-replicate comparison (compute permitting) for a direct comparison to Huang et al. 2024's Fig 4
 - Apply NLA-GP to other empirical regime-shift datasets (e.g. Pacific Decadal Oscillation, per Huang et al. 2024 Sec. 3.2)

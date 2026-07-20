@@ -20,7 +20,10 @@ We aim to translate the NLA core algorithms into R and we want to actualize the 
 
 ### Status
 
-A first working implementation of **NLA-GP** (Huang et al. 2024's NLA algorithm, with GP-EDM in place of S-map) lives entirely in `quarto_notebooks/1_implement.qmd` -- validated on a synthetic regime-shift model (and compared there against the original NLA-S-map) and applied to the full, z-scored Lake Zurich plankton dataset (all 13 functional groups). All code lives in that notebook; there are no standalone R scripts.
+A first working implementation of **NLA-GP** (Huang et al. 2024's NLA algorithm, with GP-EDM in place of S-map) is split across two self-contained notebooks -- there are no standalone R scripts:
+
+- `quarto_notebooks/1_implement.qmd`: the algorithm, and validation against the original NLA-S-map on Huang et al. 2024's own food-chain regime-shift benchmark (replicated simulations, known change point).
+- `quarto_notebooks/2_empirical.qmd`: applied to the full, z-scored Lake Zurich plankton dataset (all 13 functional groups), compared against Medeiros et al. 2025's independent change-point analysis.
 
 ### License
 
