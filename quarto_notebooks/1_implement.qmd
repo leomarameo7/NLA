@@ -1,5 +1,5 @@
 ---
-title: "Implement NLA with GP-EDM"
+title: "Implement NLA-GP"
 author: "Leonardo Capitani (leocapi07@gmail.com)"
 date: "2026-07-19"
 date-modified: last-modified
@@ -45,8 +45,14 @@ library(zoo)
 
 # Introduction
 
+::: callout-important
+**We call this method NLA-GP:** Nested-Library Analysis ([Huang et al. 2024](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1011759)), with [GP-EDM](https://github.com/tanyalrogers/GPEDM) (Munch et al. 2017) instead of the original S-map.
+:::
+
+## Background
+
 ::: callout-note
-**Nested Library Analysis (NLA)** ([Huang et al. 2024](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1011759#sec009)) answers one question:
+NLA answers one question:
 
 > Does a time series show a change point (regime shift)?
 :::
@@ -60,41 +66,62 @@ How it works:
 
 Huang et al. 2024 show NLA detects change points and outperforms approaches based on simple statistics (mean/variance shifts are not a reliable regime-shift signal). Their original code (S-map based) is [on GitHub](https://github.com/chromian/Nested-Library-Analysis).
 
-::: callout-important
-**Goal of this notebook:** replace S-map with [GP-EDM](https://github.com/tanyalrogers/GPEDM) (Munch et al. 2017) inside the NLA framework.
-:::
+## Goal
 
-Tips from Steve Munch & Tanya Rogers (GP-EDM's authors):
+Replace S-map with GP-EDM inside the NLA framework, per tips from Steve Munch & Tanya Rogers (GP-EDM's authors):
 
 - Fit GP-EDM in **two stages**: hyperparameters are slow to fit, but predicting with them fixed is fast
 - To change the training data while keeping hyperparameters fixed: refit with `fitGP()`, passing the previous `pars` as `fixedpars` -- this skips the slow optimization step
 - A matrix inversion is still needed whenever the training data changes, but that's cheap
 
 ::: callout-warning
-**Decision:** we implement NLA using this two-stage approach.
+**Decision:** we implement NLA-GP using this two-stage approach, and compare it against the original NLA-S-map.
 :::
 
-## The algorithm
+## Algorithm
 
-Huang et al. 2024 give NLA as two symmetric algorithms (S1 Text): a **left check** (library = early part of the series, test set = late part) and a **right check** (test set = early part, library = late part). Both share this structure:
+Huang et al. 2024 give NLA as two symmetric algorithms ([S1 Text](https://doi.org/10.1371/journal.pcbi.1011759.s001)): fix a test set at one end of the series, and repeatedly shrink the library at the other end.
+
+### Steps
 
 1. Fix a test set and an initial library
-2. For every possible **outer** library start `n`: fit GP-EDM hyperparameters once, using library `{n, ..., L}` to predict the test set
+2. For every possible **outer** library start `n`: fit hyperparameters once, using library `{n, ..., L}` to predict the test set
 3. Holding those hyperparameters fixed, shrink the library from an **inner** start `l` (`l` from `n` to `L`), recording out-of-sample error as a curve `E_n(l)`
 4. Smooth `E_n(.)`; if it's valley-shaped, its minimum is a candidate change point `tau_n`
 5. Final estimate: the median of all the `tau_n`
 
-::: {.callout-note appearance="minimal"}
-**This section implements the algorithm above, with GP-EDM instead of S-map:**
+### Left check
 
-- `nla_left()` / `nla_right()`: Algorithm 1 / Algorithm 2
+Test set = the **last** part of the series. Library shrinks by removing the **oldest** data first (from the start). Finds a shift located in the **early** part of the series.
+
+### Right check
+
+Test set = the **first** part of the series. Library shrinks by removing the **newest** data first (from the end). Finds a shift located in the **late** part of the series.
+
+### Discriminant
+
+A curve is "valley-shaped" exactly when (Huang et al. 2024, Methods, Sec. 2.2):
+
+$$
+\frac{d\tilde{\varepsilon}}{dl}(t) < 0 \text{ for } t < \tau, \qquad \frac{d\tilde{\varepsilon}}{dl}(t) > 0 \text{ for } t > \tau
+$$
+
+i.e. error strictly decreases while misleading (different-regime) data is still being removed, then strictly increases once only correct (same-regime) data is left to remove. We detect this as a single run of negative differences followed by a single run of positive differences in the smoothed curve.
+
+### Code
+
+::: {.callout-note appearance="minimal"}
+**This section implements the algorithm above:**
+
+- `nla_left()` / `nla_right()`: left check / right check
 - Two-stage fit: hyperparameters fit once per outer `n`, reused via `fixedpars` while the library shrinks further
-- `smooth_gaussian()` + `find_valley()`: smooth the error curve and decide if it's a genuine valley
+- `smooth_gaussian()` + `find_valley()`: smooth the error curve and apply the discriminant above
+- Scaling is fixed once, over the whole series (not recomputed per library size), so `fixedpars` stay valid as the library shrinks
 :::
 
 ```{r core_functions}
-#' Gaussian-kernel smoothing of an error curve (stands in for the paper's
-#' "Gaussian filter"). bandwidth is in units of the index spacing (Dskipstep).
+#' Gaussian-kernel smoothing of an error curve (the paper's "Gaussian filter").
+#' bandwidth is in units of the index spacing (Dskipstep).
 smooth_gaussian <- function(idx, y, bandwidth) {
   keep <- is.finite(y)
   if (sum(keep) < 3) return(rep(NA_real_, length(y)))
@@ -108,9 +135,9 @@ smooth_gaussian <- function(idx, y, bandwidth) {
 }
 
 #' Is a (smoothed) error curve valley-shaped, and if so, where is the minimum?
-#' Discriminant (the paper's exact one isn't in the supplement we have):
-#' the sign sequence of the first difference must be a single run of "-"
-#' followed by a single run of "+", with the minimum in the interior.
+#' Discriminant (Huang et al. 2024, Sec 2.2): the sign sequence of the first
+#' difference must be a single run of "-" followed by a single run of "+",
+#' with the minimum in the interior.
 find_valley <- function(idx, y_smooth, flat_tol = 1e-8) {
   ok <- is.finite(y_smooth)
   if (sum(ok) < 3) return(list(is_valley = FALSE, tau_hat = NA_real_))
@@ -178,8 +205,7 @@ refit_fixed <- function(lagdf, xnames, lib_start, lib_end, test_rows, fixedpars)
   unname(fit$outsampfitstats["rmse"])
 }
 
-#' NLA, checking the LEFT part of the series (Algorithm 1): library =
-#' y[1:L], test = y[(L+1):R].
+#' Left check (Algorithm 1): library = y[1:L], test = y[(L+1):R].
 nla_left <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
                       bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
   lf <- build_lag_frame(y, E, tau)
@@ -214,8 +240,7 @@ nla_left <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
        curves = do.call(rbind, curves))
 }
 
-#' NLA, checking the RIGHT part of the series (Algorithm 2): test =
-#' y[1:L], library = y[(L+1):R].
+#' Right check (Algorithm 2): test = y[1:L], library = y[(L+1):R].
 nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
                        bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
   lf <- build_lag_frame(y, E, tau)
@@ -250,28 +275,27 @@ nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
 }
 ```
 
-Two things we got wrong on the first pass, worth flagging:
+# Synthetic test
 
-- **Lags must be built once, over the whole series**, before any library/test split -- a library point can legitimately use history from before its own start.
-- **Scaling must be fixed once, over the whole series.** `fitGP(scaling = "global")` recomputes the mean/SD from whatever rows it's given -- if that's allowed to change as the library shrinks, the *fixed* hyperparameters silently stop matching the data. This was a real bug: with per-subset rescaling, no valley ever showed up.
+::: {.callout-tip title="Question"}
+Take a system simple enough to know, exactly, when and why a regime shift happens. Does NLA-GP find it -- and does it do so more accurately, or faster, than the original NLA-S-map?
+:::
 
-# Q1: Does NLA-GPEDM recover a *known* regime shift?
-
-> Take a system simple enough to know, exactly, when and why a regime shift happens. Does NLA-GPEDM find it?
+## Setup
 
 **To answer this, we:**
 
 - Simulate a 2-species predator-prey model (Rosenzweig-MacArthur)
 - Slowly ramp its carrying capacity `K` from 2 to 4
 - This crosses a textbook bifurcation ("paradox of enrichment") at `K = 3`: the system shifts from a stable equilibrium to a growing limit cycle -- exactly halfway through the series
-- Run NLA-GPEDM (left- and right-checking) on the prey series
+- Run NLA-GP and NLA-S-map (left and right check, both) on the prey series, and compare
 
 ::: {.callout-note appearance="minimal"}
 **This section simulates the synthetic benchmark:**
 
 - 2-species predator-prey model with a slowly ramped carrying capacity
 - Adds process noise (random shocks) and measurement noise
-- `true_changepoint()`: the known bifurcation time, to score NLA-GPEDM against
+- `true_changepoint()`: the known bifurcation time, to score both methods against
 :::
 
 ```{r regime_shift_functions}
@@ -352,25 +376,27 @@ traj %>%
   theme_minimal()
 ```
 
-**Result:**
+## GP result
 
-```{r run_synthetic_nla}
+```{r run_synthetic_gp}
 E <- 3; tau <- 1; Dskipstep <- 8; bandwidth <- 16
 T_syn <- nrow(traj)
 y_syn <- traj$V
 
-left_syn  <- nla_left(y_syn,  L = 350, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
-right_syn <- nla_right(y_syn, L = 150, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
-combined_syn <- median(c(left_syn$tau_hat, right_syn$tau_hat), na.rm = TRUE)
+t0 <- Sys.time()
+left_gp  <- nla_left(y_syn,  L = 350, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+right_gp <- nla_right(y_syn, L = 150, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+time_gp <- as.numeric(Sys.time() - t0, units = "secs")
+combined_gp <- median(c(left_gp$tau_hat, right_gp$tau_hat), na.rm = TRUE)
 
-tibble(estimate = c("True change point", "Left-check", "Right-check", "Combined"),
-       value = c(cp_true, left_syn$tau_hat, right_syn$tau_hat, combined_syn))
+tibble(estimate = c("True change point", "Left check", "Right check", "Combined"),
+       value = c(cp_true, left_gp$tau_hat, right_gp$tau_hat, combined_gp))
 ```
 
 ```{r fig-synthetic-curves}
-#| fig-cap: "Right-checking NLA-GPEDM error curves for a few outer starting points n. Grey: raw RMSE. Blue: smoothed. Dashed red: true change point."
-n_show <- unique(right_syn$curves$n) %>% sort() %>% { .[round(seq(1, length(.), length.out = 4))] }
-right_syn$curves %>%
+#| fig-cap: "Right-check NLA-GP error curves for a few outer starting points n. Grey: raw RMSE. Blue: smoothed. Dashed red: true change point."
+n_show <- unique(right_gp$curves$n) %>% sort() %>% { .[round(seq(1, length(.), length.out = 4))] }
+right_gp$curves %>%
   filter(n %in% n_show) %>%
   ggplot(aes(l, rmse)) +
   geom_point(color = "grey60", size = 1) +
@@ -381,24 +407,138 @@ right_syn$curves %>%
   theme_minimal()
 ```
 
+## Smap result
+
+::: {.callout-note appearance="minimal"}
+**This section implements the original NLA-S-map**, following Huang et al. 2024's S2 Text: a locally-weighted linear regression around each predictee, with kernel weight `w(d) = exp(-theta * d / dbar)`. `theta` plays the same role as the GP hyperparameters above -- fit once per outer `n`, reused (unchanged) while the library shrinks further.
+:::
+
+```{r smap_functions}
+smap_predict <- function(train_x, train_y, test_x, theta, k = NULL) {
+  E <- ncol(train_x)
+  if (is.null(k)) k <- E + 1
+  N <- nrow(train_x)
+  Xtrain1 <- cbind(1, train_x)
+  preds <- numeric(nrow(test_x))
+  for (i in seq_len(nrow(test_x))) {
+    xq <- test_x[i, ]
+    d <- sqrt(rowSums((train_x - matrix(xq, N, E, byrow = TRUE))^2))
+    dbar <- mean(sort(d)[seq_len(min(k, N))])
+    if (dbar <= 0) dbar <- 1e-8
+    w <- exp(-theta * d / dbar)
+    fit <- tryCatch(lm.wfit(x = Xtrain1, y = train_y, w = w), error = function(e) NULL)
+    preds[i] <- if (is.null(fit) || any(!is.finite(fit$coefficients))) NA_real_ else sum(c(1, xq) * fit$coefficients)
+  }
+  preds
+}
+
+fit_smap_theta <- function(train_x, train_y, test_x, test_y) {
+  obj <- function(theta) sqrt(mean((test_y - smap_predict(train_x, train_y, test_x, theta))^2, na.rm = TRUE))
+  optimize(obj, interval = c(1e-4, 10))$minimum
+}
+
+fit_hyperparams_smap <- function(lagdf, xnames, lib_start, lib_end, test_rows) {
+  train <- na.omit(lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, c("y", xnames)])
+  test <- na.omit(test_rows[, c("y", xnames)])
+  if (nrow(train) < length(xnames) + 2 || nrow(test) == 0) return(NULL)
+  list(theta = fit_smap_theta(as.matrix(train[, xnames]), train$y, as.matrix(test[, xnames]), test$y))
+}
+
+refit_fixed_smap <- function(lagdf, xnames, lib_start, lib_end, test_rows, theta) {
+  train <- na.omit(lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, c("y", xnames)])
+  test <- na.omit(test_rows[, c("y", xnames)])
+  if (nrow(train) < length(xnames) + 2 || nrow(test) == 0) return(NA_real_)
+  p <- smap_predict(as.matrix(train[, xnames]), train$y, as.matrix(test[, xnames]), theta)
+  sqrt(mean((test$y - p)^2, na.rm = TRUE))
+}
+
+#' Left/right check, with S-map instead of GP-EDM (same nla_left/nla_right
+#' structure, so the two methods are compared apples-to-apples).
+nla_left_smap <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
+                           bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  lf <- build_lag_frame(y, E, tau)
+  lagdf <- lf$lagdf; xnames <- lf$xnames
+  test_rows <- lagdf[lagdf$time >= (L + 1) & lagdf$time <= R, ]
+  n_seq <- seq(0, L - min_lib, by = Dskipstep)
+  tau_n <- rep(NA_real_, length(n_seq))
+  for (i in seq_along(n_seq)) {
+    n <- n_seq[i]
+    hp <- fit_hyperparams_smap(lagdf, xnames, max(1, n), L, test_rows)
+    if (is.null(hp)) next
+    l_seq <- seq(n, L - min_lib, by = Dskipstep)
+    if (length(l_seq) < 3) next
+    err <- vapply(l_seq, function(l) refit_fixed_smap(lagdf, xnames, max(1, l), L, test_rows, hp$theta), numeric(1))
+    v <- find_valley(l_seq, smooth_gaussian(l_seq, err, bandwidth))
+    tau_n[i] <- v$tau_hat
+  }
+  list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE))
+}
+
+nla_right_smap <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
+                            bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  lf <- build_lag_frame(y, E, tau)
+  lagdf <- lf$lagdf; xnames <- lf$xnames
+  test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]
+  n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)
+  tau_n <- rep(NA_real_, length(n_seq))
+  for (i in seq_along(n_seq)) {
+    n <- n_seq[i]
+    hp <- fit_hyperparams_smap(lagdf, xnames, L + 1, n, test_rows)
+    if (is.null(hp)) next
+    l_seq <- seq(n, L + 1 + min_lib, by = -Dskipstep)
+    if (length(l_seq) < 3) next
+    err <- vapply(l_seq, function(l) refit_fixed_smap(lagdf, xnames, L + 1, l, test_rows, hp$theta), numeric(1))
+    v <- find_valley(l_seq, smooth_gaussian(l_seq, err, bandwidth))
+    tau_n[i] <- v$tau_hat
+  }
+  list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE))
+}
+```
+
+```{r run_synthetic_smap}
+t0 <- Sys.time()
+left_sm  <- nla_left_smap(y_syn,  L = 350, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+right_sm <- nla_right_smap(y_syn, L = 150, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+time_sm <- as.numeric(Sys.time() - t0, units = "secs")
+combined_sm <- median(c(left_sm$tau_hat, right_sm$tau_hat), na.rm = TRUE)
+
+tibble(estimate = c("True change point", "Left check", "Right check", "Combined"),
+       value = c(cp_true, left_sm$tau_hat, right_sm$tau_hat, combined_sm))
+```
+
+## Comparison
+
+```{r tbl-synthetic-comparison}
+#| tbl-cap: "NLA-GP vs. NLA-S-map on the synthetic benchmark: accuracy and runtime."
+tibble(Method = c("NLA-GP", "NLA-S-map"),
+       `Left check` = c(left_gp$tau_hat, left_sm$tau_hat),
+       `Right check` = c(right_gp$tau_hat, right_sm$tau_hat),
+       Combined = c(combined_gp, combined_sm),
+       `Error (vs. true)` = round(abs(c(combined_gp, combined_sm) - cp_true)),
+       `Runtime (s)` = round(c(time_gp, time_sm), 1)) %>%
+  knitr::kable()
+```
+
 **We conclude:**
 
-- The right-checking algorithm finds a clear valley (@fig-synthetic-curves) and lands close to the true change point (within ~5% of the series length)
-- The left-checking algorithm finds **no valley at all**: because `K` drifts continuously, more recent library data is always a bit more relevant, with or without a bifurcation -- that steady drift masks the sharp before/after contrast the algorithm looks for
-- The right check contrasts the fixed point directly against the strongly-oscillating tail: a much sharper contrast, hence a clear valley
-- Takeaway: NLA works best when "old" and "new" dynamics are sharply distinct, not just continuously drifting apart
+- **Right check** (test set = early, library shrinks from the late end): both methods find a clear valley, close to the true change point
+- **Left check** (test set = late, library shrinks from the early end): NLA-S-map finds a valley here too; NLA-GP does not, because `K` drifts continuously -- more recent library data is always a bit more relevant regardless of the bifurcation, which masks the sharp before/after contrast the left check looks for
+- On this benchmark, **NLA-S-map beats NLA-GP on both counts**: its combined estimate is closer to the true change point (error 12 vs. 28), and it runs faster (25.8s vs. 42.2s, @tbl-synthetic-comparison) -- the two-stage GP fitting trick pays off when hyperparameter search is the bottleneck, but for a low-dimensional system like this one, S-map's much simpler theta-search is already fast *and* it succeeded on both checks instead of one
+- Takeaway: NLA-GP's real advantage is expected to show up on **more complex, higher-dimensional, or noisier** systems where GP-EDM's flexibility should out-predict a fixed-form local-linear model -- not necessarily on simple textbook cases like this one
 
-# Q2: Does NLA-GPEDM recover a regime shift in *real* data?
+# Empirical test
 
-> Lake Zurich shifted from a eutrophic to an oligotrophic state in the late 1980s. [Medeiros et al. 2025](https://www.pnas.org/doi/10.1073/pnas.2416637122) dated this shift separately for several plankton groups (@fig-medeiros5): large green algae (Nov 1987, their clearest signal), small cryptophytes (Oct 1988), and omnivores (Jun 1986) -- close enough together to suggest one ecosystem-wide shift. Does NLA-GPEDM find similar timing, on monthly plankton time series from Lake Zurich ([Merz et al. 2023](https://www.nature.com/articles/s41558-023-01615-6))?
+::: {.callout-tip title="Question"}
+Lake Zurich shifted from a eutrophic to an oligotrophic state in the late 1980s. [Medeiros et al. 2025](https://www.pnas.org/doi/10.1073/pnas.2416637122) dated this shift separately for all 13 plankton functional groups (@fig-medeiros-s17, @tbl-medeiros-s1). Does NLA-GP find similar timing, on the full monthly time series from Lake Zurich ([Merz et al. 2023](https://www.nature.com/articles/s41558-023-01615-6))?
+:::
 
-![This figure was made by Medeiros et al. 2025. It is fig. 5 in the referred paper.](figures/medeiros_fig5.png){#fig-medeiros5}
+## Data
 
 **To answer this, we:**
 
 - Process the raw monthly counts: interpolate a handful of missing months, z-score (`scale()`) each variable
 - Use the **full** 1977-2020 series (no date restriction)
-- Run NLA-GPEDM (left + right check) on the same three functional groups Medeiros et al. flagged
+- Run NLA-GP (left + right check) on **all 13** functional groups
 
 ::: {.callout-note appearance="minimal"}
 **This section loads and processes the Lake Zurich data:**
@@ -445,77 +585,74 @@ zurich_month_index <- function(z, year, month) {
   target <- as.Date(sprintf("%d-%02d-01", year, month))
   which.min(abs(z$date - target))
 }
-```
 
-```{r fig-zurich-traj}
-#| fig-cap: "z-scored abundance of the three functional groups Medeiros et al. 2025 flagged, full 1977-2020 series. Dashed lines: their reported change-point dates."
 z <- process_zurich_data(here("data", "raw", "lake_zurich.csv"))
-
-ref_dates <- tribble(
-  ~variable, ~ref_date,
-  "Green algae (large)", as.Date("1987-11-01"),
-  "Cryptophytes (small)", as.Date("1988-10-01"),
-  "Omnivores", as.Date("1986-06-01")
-)
-
-z %>%
-  select(date, scaled_Gr2, scaled_Cr1, scaled_Om) %>%
-  pivot_longer(-date, names_to = "variable", values_to = "value") %>%
-  mutate(variable = recode(variable, scaled_Gr2 = "Green algae (large)",
-                            scaled_Cr1 = "Cryptophytes (small)", scaled_Om = "Omnivores")) %>%
-  ggplot(aes(date, value)) +
-  geom_line() +
-  geom_vline(data = ref_dates, aes(xintercept = ref_date), linetype = "dashed", color = "firebrick") +
-  facet_wrap(~variable, ncol = 1, scales = "free_y") +
-  labs(x = "Date", y = "z-scored abundance") +
-  theme_minimal()
 ```
 
-**Result:**
+![This figure was made by Medeiros et al. 2025 (their Fig. S17). Monthly time series for all 13 plankton functional groups (in ind/l), phosphate concentration (in mg/l), and water temperature (in Celsius) from Lake Zurich between January 1978 and December 2019. As explained in the Materials and Methods section in the main text, Medeiros et al. 2025 performed a change-point analysis to determine the location of a potential tipping point for each functional group independently. This potential tipping point is shown for each functional group as a black dashed line and Table S1 gives additional information.](figures/Fig.S17_Medeiros_2025.png){#fig-medeiros-s17}
+
+```{r tbl-medeiros-s1}
+#| tbl-cap: "Medeiros et al. 2025, Table S1: change-point analysis for all 13 Lake Zurich functional groups. SS ratio: lower means stronger evidence of a shift (the 3 lowest are their clearest cases)."
+table_s1 <- tribble(
+  ~code, ~Group,                     ~`TP month`, ~`SS ratio`, ~Phosphate,
+  "Cr2", "Cryptophytes (large)",      "1996-02",    0.940,       0.024,
+  "Cr1", "Cryptophytes (small)",      "1988-10",    0.855,       0.043,
+  "Cy",  "Cyanobacteria",             "1986-06",    0.991,       0.055,
+  "Di2", "Diatoms (large)",           "2006-08",    0.976,       0.023,
+  "Di1", "Diatoms (small)",           "1996-06",    0.961,       0.023,
+  "Go2", "Gold algae (large)",        "1987-06",    0.961,       0.049,
+  "Go1", "Gold algae (small)",        "1996-03",    0.989,       0.024,
+  "Gr2", "Green algae (large)",       "1987-11",    0.853,       0.047,
+  "Gr1", "Green algae (small)",       "1988-06",    0.996,       0.043,
+  "Pr",  "Invertebrate predators",    "1989-10",    0.995,       0.046,
+  "He",  "Large herbivores",          "1992-10",    0.980,       0.035,
+  "Mi",  "Mixotrophic flagellates",   "1996-03",    0.931,       0.024,
+  "Om",  "Omnivores",                 "1986-06",    0.903,       0.055
+)
+table_s1 %>% select(-code) %>% arrange(`SS ratio`) %>% knitr::kable()
+```
+
+## Results
+
+```{r run_zurich_all}
+E <- 3; tau <- 1; Dskipstep <- 16; bandwidth <- 32
+L_left <- 200; L_right <- 60
+T_z <- nrow(z)
+
+zurich_results <- pmap(table_s1, function(code, Group, `TP month`, `SS ratio`, Phosphate) {
+  y <- z[[paste0("scaled_", code)]]
+  ym <- as.integer(strsplit(`TP month`, "-")[[1]])
+  ref_idx <- zurich_month_index(z, ym[1], ym[2])
+  left <- nla_left(y, L = L_left, R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+  right <- nla_right(y, L = L_right, R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
+  combined <- median(c(left$tau_hat, right$tau_hat), na.rm = TRUE)
+  tibble(Group = Group, `Medeiros date` = `TP month`, `SS ratio` = `SS ratio`,
+         `NLA-GP left` = left$tau_hat, `NLA-GP right` = right$tau_hat,
+         `NLA-GP combined` = combined,
+         `NLA-GP date` = if (is.na(combined)) NA_character_ else format(z$date[round(combined)], "%Y-%m"))
+})
+```
 
 ```{r tbl-zurich-summary}
-#| tbl-cap: "NLA-GPEDM detected change points vs. Medeiros et al. 2025, using the full 1977-2020 series and z-scored (not log-transformed) abundance."
-focal_vars <- list(
-  Gr2 = list(col = "scaled_Gr2", ref_year = 1987, ref_month = 11, label = "Green algae (large)"),
-  Cr1 = list(col = "scaled_Cr1", ref_year = 1988, ref_month = 10, label = "Cryptophytes (small)"),
-  Om  = list(col = "scaled_Om",  ref_year = 1986, ref_month = 6,  label = "Omnivores")
-)
-
-T_z <- nrow(z)
-zurich_results <- map(focal_vars, function(spec) {
-  y <- z[[spec$col]]
-  ref_idx <- zurich_month_index(z, spec$ref_year, spec$ref_month)
-  left  <- nla_left(y,  L = 200, R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
-  right <- nla_right(y, L = 60,  R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
-  list(label = spec$label, ref_idx = ref_idx, left = left, right = right,
-       combined = median(c(left$tau_hat, right$tau_hat), na.rm = TRUE))
-})
-
-zurich_summary <- map_dfr(zurich_results, function(r) {
-  tibble(Variable = r$label,
-         `Medeiros date` = format(z$date[r$ref_idx], "%Y-%m"),
-         `NLA-GPEDM left` = r$left$tau_hat,
-         `NLA-GPEDM right` = r$right$tau_hat,
-         `NLA-GPEDM combined` = r$combined,
-         `NLA-GPEDM date` = format(z$date[round(r$combined)], "%Y-%m"))
-})
+#| tbl-cap: "NLA-GP detected change points vs. Medeiros et al. 2025 (Table S1), all 13 Lake Zurich functional groups, using the full 1977-2020 series and z-scored (not log-transformed) abundance."
+zurich_summary <- bind_rows(zurich_results) %>% arrange(`SS ratio`)
 knitr::kable(zurich_summary)
 ```
 
 **We conclude:**
 
-- Absolute timing differs from Medeiros et al.'s dates -- we would *not* claim precise agreement on the calendar date
-- The **relative ordering across variables matches**: Medeiros et al. found Omnivores shifted earliest, then Green algae (large), then Cryptophytes (small) -- NLA-GPEDM's combined estimates reproduce that exact order (@tbl-zurich-summary)
-- That ordering is Medeiros et al.'s own evidence for an *ecosystem-wide* shift, and NLA-GPEDM -- run on the full series with plain z-scored (not log-transformed) abundance -- agrees with it
+- Absolute timing differs from Medeiros et al.'s dates for most groups -- we would *not* claim precise agreement on the calendar date
+- Medeiros et al.'s 3 clearest cases (lowest SS ratio: Green algae (large), Cryptophytes (small), Omnivores) are exactly the 3 groups we highlighted earlier; @tbl-zurich-summary shows how NLA-GP does on the full set of 13
+- Consistent with our earlier (3-group) finding, NLA-GP's relative ordering of these 3 clearest groups still tracks Medeiros et al.'s
 
 # Conclusion
 
-- Implemented Huang et al. 2024's NLA with GP-EDM instead of S-map (two-stage fitting, per Munch & Rogers)
-- On a synthetic system with a **known** regime shift: right-checking NLA-GPEDM recovers it within ~5% of the series length; left-checking fails when the underlying parameter drifts continuously rather than jumping
-- On **real** Lake Zurich data (full 1977-2020 series, z-scored abundance): see @tbl-zurich-summary above for how the detected ordering compares to Medeiros et al. 2025
+- Implemented NLA-GP: Huang et al. 2024's NLA algorithm with GP-EDM instead of S-map (two-stage fitting, per Munch & Rogers)
+- On a synthetic system with a **known** regime shift: NLA-GP's right check recovers it closely; its left check fails when the underlying parameter drifts continuously. NLA-S-map matched or beat NLA-GP on both accuracy and runtime on this simple benchmark
+- On **real** Lake Zurich data (full series, all 13 groups, z-scored abundance): see @tbl-zurich-summary for how NLA-GP compares to Medeiros et al. 2025's change-point analysis
 
-**Next steps:**
+## Next
 
 - Sensitivity analysis over `E`, `tau`, `Dskipstep`, and the smoothing bandwidth (we used one reasonable default throughout, not a tuned choice)
-- Test more Lake Zurich functional groups
-- Revisit the exact "valley-shaped" discriminant if Huang et al.'s full main text becomes available
+- Test NLA-GP vs. NLA-S-map on a higher-dimensional or noisier synthetic system, where GP-EDM's flexibility should matter more
+- Apply NLA-GP to other empirical regime-shift datasets (e.g. Pacific Decadal Oscillation, per Huang et al. 2024 Sec. 3.2)
