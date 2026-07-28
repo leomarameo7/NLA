@@ -36,11 +36,17 @@ editor_options:
 ---
 
 ```{r load_libraries}
-library(GPEDM)
-library(tidyverse)
-library(here)
-library(deSolve)
-library(zoo)
+# --- Packages used in this notebook -----------------------------------------
+# Each library() call loads a set of extra functions into R. Without these,
+# the function names used below (fitGP, ggplot, ode, ...) would not exist.
+library(GPEDM)     # Gaussian Process EDM: fitGP() (the forecaster) and
+                   # makelags() (builds the "time-delay" columns we need)
+library(tidyverse) # data wrangling + plotting: dplyr, tidyr, ggplot2, purrr...
+library(here)      # builds file paths relative to the project root, so the
+                   # code works on any computer without editing paths
+library(deSolve)   # numerically solves differential equations: used to
+                   # simulate the food-chain model further below
+library(zoo)       # helpers for time series (moving averages, interpolation)
 ```
 
 # Introduction
@@ -88,6 +94,10 @@ Replace S-map with GP-EDM inside the NLA framework, per tips from Steve Munch & 
 
 ## Algorithm
 
+::: {.callout-tip title="Question"}
+Concretely, what does NLA *do* to a time series -- what gets fitted, what gets thrown away, and what number comes out at the end?
+:::
+
 Huang et al. 2024 give NLA as two symmetric algorithms ([S1 Text](https://doi.org/10.1371/journal.pcbi.1011759.s001)). The core idea, from their Fig 1 (@fig-nla-concept):
 
 - Fix one end of the time series as a **test set**, used only to check out-of-sample forecast skill -- never to fit anything.
@@ -98,26 +108,47 @@ Huang et al. 2024 give NLA as two symmetric algorithms ([S1 Text](https://doi.or
 
 ```{r fig-nla-concept}
 #| fig-cap: "The core idea of NLA (redrawn after Huang et al. 2024, Fig 1). Five trials shrink the library by different amounts. Trial 3 removes exactly the misleading (different-regime) data and nothing else -- the best-performing library."
-true_cp <- 15; L <- 30; R <- 40
+# This chunk draws a *cartoon* of the method. No real data, no model fitting --
+# it just colours a grid of dots so the idea is visible at a glance.
+
+true_cp <- 15   # where the (pretend) regime shift happens, in time steps
+L       <- 30   # last time step belonging to the library
+R       <- 40   # length of the whole (pretend) time series
+
+# One row per "trial". `l` = how many of the oldest points that trial throws
+# away. Trial 1 throws away nothing, Trial 5 throws away 30 points.
 trials <- tibble(trial = 1:5, l = c(0, 8, 15, 23, 30),
                   label = c("Trial 1", "Trial 2", "Trial 3 (best)", "Trial 4", "Trial 5"))
 
 trials %>%
+  # crossing() makes every combination of trial x time step, i.e. one dot per
+  # (trial, time) pair -- 5 trials x 40 time steps = 200 dots.
   crossing(time = 1:R) %>%
+  # Label each dot. case_when() is a chain of if/else tests, read top to
+  # bottom: the FIRST matching condition wins.
   mutate(category = case_when(
+    # thrown away AND from before the shift -> misleading data (good riddance)
     time <= pmin(l, true_cp) ~ "removed: different regime",
+    # thrown away but from after the shift -> useful data we just lost
     time <= l               ~ "removed: same regime",
+    # kept, and used to fit the forecaster
     time <= L                ~ "library (kept)",
+    # everything past L is the held-out test set
     TRUE                     ~ "test set"
   )) %>%
+  # ggplot builds a plot in layers, combined with "+".
+  # x = time, y = the trial label, colour = the category we just assigned.
+  # fct_inorder() keeps the trials in the order written above (not alphabetical)
+  # and fct_rev() flips them so Trial 1 sits at the top.
   ggplot(aes(time, fct_rev(fct_inorder(label)), color = category)) +
-  geom_point(size = 2.5) +
-  scale_color_manual(values = c("removed: different regime" = "firebrick",
-                                 "removed: same regime" = "grey70",
-                                 "library (kept)" = "grey20",
-                                 "test set" = "steelblue")) +
-  labs(x = "Time", y = NULL, color = NULL) +
-  theme_minimal() +
+  geom_point(size = 2.5) +                    # draw the dots
+  scale_color_manual(values = c(              # pick the colour of each category
+    "removed: different regime" = "firebrick",
+    "removed: same regime" = "grey70",
+    "library (kept)" = "grey20",
+    "test set" = "steelblue")) +
+  labs(x = "Time", y = NULL, color = NULL) +  # axis titles (NULL = no title)
+  theme_minimal() +                           # plain, gridline-only look
   theme(legend.position = "bottom")
 ```
 
@@ -155,6 +186,14 @@ i.e. error strictly decreases while misleading (different-regime) data is still 
 
 ### Code
 
+::: {.callout-tip title="Question"}
+How do those steps translate into R? Which function does which part of the algorithm -- and where does the two-stage speed-up actually happen?
+:::
+
+::: {.callout-note appearance="minimal"}
+**Reading the code:** every chunk below is commented line by line, so no prior R is assumed. Two idioms recur throughout and are worth knowing up front: `%>%` (the "pipe") passes the result on the left into the function on the right, so `x %>% f()` is just `f(x)`; and `$` pulls one named element out of a list or table, so `fit$pars` means "the `pars` part of `fit`".
+:::
+
 We split the implementation into two pieces: (1) fitting GP-EDM and shrinking the library, and (2) smoothing the resulting error curve and applying the discriminant.
 
 ::: {.callout-note appearance="minimal"}
@@ -176,26 +215,63 @@ We split the implementation into two pieces: (1) fitting GP-EDM and shrinking th
 #' ONLY place scaling happens -- every fitGP() call below uses
 #' scaling = "none" so it is never rescaled again.
 build_lag_frame <- function(y, E, tau) {
-  T <- length(y)
+  # y   = the observed time series, as a plain numeric vector
+  # E   = "embedding dimension": how many past values we use as predictors
+  # tau = the spacing between those past values (tau = 1 means consecutive)
+
+  T <- length(y)                                   # number of observations
+  # A tidy table with one row per time step: a time index and the value.
   base <- data.frame(time = seq_len(T), y = y)
+
+  # makelags() (from GPEDM) adds the "time-delay" predictor columns. With
+  # E = 3 and tau = 1 it appends y_1, y_2, y_3 = the value 1, 2 and 3 steps
+  # ago. Predicting y from its own recent past is the whole idea behind
+  # Empirical Dynamic Modelling: those lagged columns are a stand-in for the
+  # (unobserved) state of the system (Takens' theorem).
   lagdf <- makelags(data = base, y = "y", E = E, tau = tau, append = TRUE)
+
+  # Everything that is not "time" or "y" is a predictor column. setdiff()
+  # is set subtraction, so xnames ends up as c("y_1", "y_2", "y_3").
   xnames <- setdiff(names(lagdf), c("time", "y"))
 
+  # The first few rows have no "value 3 steps ago", so makelags() puts NA
+  # there. complete.cases() flags the rows where nothing is missing; we use
+  # only those rows to compute the mean and sd below.
   complete <- stats::complete.cases(lagdf[, c("y", xnames)])
+
+  # z-score the response: subtract the mean, divide by the standard
+  # deviation, so the column has mean 0 and sd 1. Done ONCE here, on the
+  # whole series, so the scale never changes as the library shrinks.
   ymean <- mean(lagdf$y[complete]); ysd <- sd(lagdf$y[complete])
   lagdf$y <- (lagdf$y - ymean) / ysd
+
+  # Same z-scoring for each predictor column, one at a time.
+  # lagdf[[xn]] pulls out the column whose *name* is stored in xn.
   for (xn in xnames) {
     xmean <- mean(lagdf[[xn]][complete]); xsd <- sd(lagdf[[xn]][complete])
     lagdf[[xn]] <- (lagdf[[xn]] - xmean) / xsd
   }
+
+  # R functions return one object, so we bundle both results in a list.
   list(lagdf = lagdf, xnames = xnames)
 }
 
 #' Fit GP hyperparameters on library rows [lib_start, lib_end] and evaluate
 #' out-of-sample RMSE on test_rows.
 fit_hyperparams <- function(lagdf, xnames, lib_start, lib_end, test_rows) {
+  # Keep only the rows whose time index falls inside the library window.
+  # The "&" means both conditions must hold; the result is the training set.
   train <- lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, ]
+
+  # tryCatch() runs the code and, if it throws an error, returns NULL instead
+  # of stopping the whole notebook. The optimiser inside fitGP() occasionally
+  # fails on awkward libraries, and we would rather skip that case than crash.
   tryCatch(
+    # fitGP() fits the Gaussian Process forecaster: predict y from the lag
+    # columns. scaling = "none" tells it NOT to re-standardise the data (we
+    # already did that, once, in build_lag_frame). newdata = test_rows makes
+    # it also predict the held-out test set, and report the error there.
+    # This is the SLOW call: it searches for the best hyperparameters.
     fitGP(data = train, y = "y", x = xnames, scaling = "none", newdata = test_rows),
     error = function(e) NULL
   )
@@ -205,70 +281,133 @@ fit_hyperparams <- function(lagdf, xnames, lib_start, lib_end, test_rows) {
 #' for the new (smaller) library is recomputed.
 refit_fixed <- function(lagdf, xnames, lib_start, lib_end, test_rows, fixedpars) {
   train <- lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, ]
+
+  # Guard: a fit needs more data points than parameters. na.omit() drops rows
+  # with missing values; if too few usable rows remain, give up on this
+  # library and return NA (a missing number) rather than a bad fit.
   if (nrow(na.omit(train[, c("y", xnames)])) < length(xnames) + 2) return(NA_real_)
+
   fit <- tryCatch(
+    # Same call as above, but fixedpars hands fitGP() the hyperparameters we
+    # already found -- so it SKIPS the slow search and only redoes the cheap
+    # linear algebra for this smaller library. This is the two-stage trick.
     fitGP(data = train, y = "y", x = xnames, scaling = "none",
           fixedpars = fixedpars, newdata = test_rows),
     error = function(e) NULL
   )
-  if (is.null(fit)) return(NA_real_)
+  if (is.null(fit)) return(NA_real_)  # the fit failed -> report a missing value
+
+  # Pull out the out-of-sample RMSE (root mean squared error on the test set):
+  # the single number saying how badly this library forecast the test set.
+  # Smaller = better. unname() just strips the "rmse" label off it.
   unname(fit$outsampfitstats["rmse"])
 }
 
 #' Left check (Algorithm 1): library = y[1:L], test = y[(L+1):R].
 nla_left <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
                       bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  # Arguments (values after "=" are defaults, used if you don't supply them):
+  #   L         = last time step of the library; the test set starts at L + 1
+  #   R         = last time step used at all (default: end of the series)
+  #   Dskipstep = step size of the search -- we try every 5th cut point, not
+  #               every single one, to keep the runtime manageable
+  #   bandwidth = how much to smooth the error curve before looking for a dip
+  #   min_lib   = smallest library we are willing to fit (needs a few more
+  #               rows than predictors)
+
+  # Build the lag columns + z-score, once (see build_lag_frame above).
   lf <- build_lag_frame(y, E, tau)
   lagdf <- lf$lagdf; xnames <- lf$xnames
+
+  # The test set: the LAST stretch of the series. It is never trained on.
   test_rows <- lagdf[lagdf$time >= (L + 1) & lagdf$time <= R, ]
 
+  # The outer loop's starting points n: 0, 5, 10, ... Each n is a different
+  # "where does the library begin" choice, giving one independent estimate.
   n_seq <- seq(0, L - min_lib, by = Dskipstep)
-  tau_n <- rep(NA_real_, length(n_seq))
-  curves <- vector("list", length(n_seq))
 
+  # Pre-allocate the results. rep(NA_real_, k) makes a length-k vector of
+  # missing numbers, which we fill in as the loop proceeds; entries left as
+  # NA mean "no change point found for this n".
+  tau_n <- rep(NA_real_, length(n_seq))
+  curves <- vector("list", length(n_seq))   # keeps the error curves, for plots
+
+  # ---- Outer loop: one pass per library starting point n -------------------
   for (i in seq_along(n_seq)) {
     n <- n_seq[i]
-    lib_start_n <- max(1, n)
+    lib_start_n <- max(1, n)   # n can be 0, but row indices start at 1
+
+    # STAGE 1 (slow, once per n): fit the hyperparameters on this library.
     hp <- fit_hyperparams(lagdf, xnames, lib_start_n, L, test_rows)
-    if (is.null(hp)) next
+    if (is.null(hp)) next      # "next" = skip to the next n
+
+    # Extract just the hyperparameters we want to hold fixed: one length-scale
+    # per predictor, plus two more (process and observation variance).
     fixedpars <- hp$pars[seq_len(length(xnames) + 2)]
 
+    # The inner loop's cut points l: how far the library start has been
+    # trimmed forward from n. Each l = one shrunken library.
     l_seq <- seq(n, L - min_lib, by = Dskipstep)
-    if (length(l_seq) < 3) next
+    if (length(l_seq) < 3) next  # too few points to see a valley shape
+
+    # STAGE 2 (fast): for each cut point l, refit with the hyperparameters
+    # frozen and record the test-set error. vapply() is a loop that returns
+    # one number (numeric(1)) per element of l_seq -- so err is the error
+    # curve E_n(l), one value per cut point.
     err <- vapply(l_seq, function(l) {
       refit_fixed(lagdf, xnames, max(1, l), L, test_rows, fixedpars)
     }, numeric(1))
 
+    # Smooth the (noisy) curve, then ask whether it is valley-shaped. If it
+    # is, find_valley() returns the position of the dip = the candidate
+    # change point for this n; if not, it returns NA.
     y_smooth <- smooth_gaussian(l_seq, err, bandwidth)
     v <- find_valley(l_seq, y_smooth)
     tau_n[i] <- v$tau_hat
+
+    # Store this n's curve so we can plot raw vs. smoothed error later.
     curves[[i]] <- data.frame(n = n, l = l_seq, rmse = err, rmse_smooth = y_smooth)
   }
 
+  # Final answer: the median of all the per-n candidates (robust to the odd
+  # wild estimate). If no n produced a candidate at all, return NA.
   list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE),
-       tau_n = data.frame(n = n_seq, tau_hat = tau_n),
+       tau_n = data.frame(n = n_seq, tau_hat = tau_n),  # the per-n estimates
+       # do.call(rbind, curves) stacks the per-n data frames into one table.
        curves = do.call(rbind, curves))
 }
 
 #' Right check (Algorithm 2): test = y[1:L], library = y[(L+1):R].
 nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
                        bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  # Mirror image of nla_left(): everything runs backwards in time. The test
+  # set is now the EARLY part of the series (rows 1..L), and the library --
+  # rows L+1..R -- is trimmed from its late (right-hand) end.
   lf <- build_lag_frame(y, E, tau)
   lagdf <- lf$lagdf; xnames <- lf$xnames
+
+  # Test set = the FIRST stretch of the series this time.
   test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]
 
+  # Note the negative step: n counts DOWN from the end of the series.
   n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)
   tau_n <- rep(NA_real_, length(n_seq))
   curves <- vector("list", length(n_seq))
 
   for (i in seq_along(n_seq)) {
     n <- n_seq[i]
+
+    # STAGE 1 (slow): library runs from L+1 up to n -- the start is pinned
+    # and the END is what varies, the mirror of the left check.
     hp <- fit_hyperparams(lagdf, xnames, L + 1, n, test_rows)
     if (is.null(hp)) next
     fixedpars <- hp$pars[seq_len(length(xnames) + 2)]
 
+    # Inner cut points, again counting down: trim the library's right edge.
     l_seq <- seq(n, L + 1 + min_lib, by = -Dskipstep)
     if (length(l_seq) < 3) next
+
+    # STAGE 2 (fast): same frozen-hyperparameter refit as in nla_left().
     err <- vapply(l_seq, function(l) {
       refit_fixed(lagdf, xnames, L + 1, l, test_rows, fixedpars)
     }, numeric(1))
@@ -296,15 +435,27 @@ nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
 #' Gaussian-kernel smoothing of an error curve (the paper's "Gaussian filter").
 #' bandwidth is in units of the index spacing (Dskipstep).
 smooth_gaussian <- function(idx, y, bandwidth) {
+  # idx       = positions along the curve (the cut points l)
+  # y         = the raw error values at those positions
+  # bandwidth = how wide the smoothing window is; bigger = smoother
+
+  # is.finite() is FALSE for NA / NaN / Inf: keep only the usable points.
   keep <- is.finite(y)
+  # sum() of a TRUE/FALSE vector counts the TRUEs. With fewer than 3 usable
+  # points there is nothing to smooth, so return all-missing.
   if (sum(keep) < 3) return(rep(NA_real_, length(y)))
-  out <- rep(NA_real_, length(y))
-  xi <- idx[keep]; yi <- y[keep]
+
+  out <- rep(NA_real_, length(y))  # container for the smoothed values
+  xi <- idx[keep]; yi <- y[keep]   # the usable positions and values
+
+  # For every position, take a weighted average of ALL usable values, where
+  # nearby points get a big weight and distant ones almost none. The weights
+  # follow a bell curve (hence "Gaussian"). This is a Nadaraya-Watson smoother.
   for (i in seq_along(idx)) {
-    w <- exp(-0.5 * ((xi - idx[i]) / bandwidth)^2)
-    out[i] <- sum(w * yi) / sum(w)
+    w <- exp(-0.5 * ((xi - idx[i]) / bandwidth)^2)  # bell-shaped weights
+    out[i] <- sum(w * yi) / sum(w)                  # weighted mean
   }
-  out
+  out   # the last expression in an R function is what it returns
 }
 
 #' Is a (smoothed) error curve valley-shaped, and if so, where is the minimum?
@@ -312,24 +463,41 @@ smooth_gaussian <- function(idx, y, bandwidth) {
 #' difference must be a single run of "-" followed by a single run of "+",
 #' with the minimum in the interior.
 find_valley <- function(idx, y_smooth, flat_tol = 1e-8) {
+  # Drop unusable points, then bail out if too few remain.
   ok <- is.finite(y_smooth)
   if (sum(ok) < 3) return(list(is_valley = FALSE, tau_hat = NA_real_))
   idx <- idx[ok]; y_smooth <- y_smooth[ok]
+
+  # Sort left-to-right by position. (The right check generates its cut points
+  # in decreasing order, so this step matters.)
   o <- order(idx); idx <- idx[o]; y_smooth <- y_smooth[o]
 
+  # diff() gives the step-to-step changes: negative = the curve is going
+  # down here, positive = going up.
   d <- diff(y_smooth)
+
+  # Treat *tiny* changes as exactly flat (0), so floating-point dust in a
+  # genuinely flat stretch is not mistaken for a real up or down move.
   scale_ <- max(abs(y_smooth), flat_tol)
-  s <- ifelse(abs(d) < flat_tol * scale_, 0, sign(d))
-  s_nz <- s[s != 0]
+  s <- ifelse(abs(d) < flat_tol * scale_, 0, sign(d))  # -1, 0 or +1
+  s_nz <- s[s != 0]                                    # drop the flat steps
   if (length(s_nz) < 2) return(list(is_valley = FALSE, tau_hat = NA_real_))
 
+  # rle() = "run length encoding": it collapses repeats, so
+  # c(-1,-1,-1,1,1) becomes the two runs c(-1, 1). A true valley is exactly
+  # that: one stretch going down, then one stretch going up. Anything else
+  # (still falling, still rising, or several dips) is rejected.
   runs <- rle(s_nz)$values
   is_valley <- length(runs) == 2 && identical(runs, c(-1, 1))
 
+  # which.min() gives the position of the smallest value -- the bottom of the
+  # dip. Reject it if it sits at either end of the curve, since that means we
+  # never actually saw the error turn back up.
   imin <- which.min(y_smooth)
   at_boundary <- imin == 1 || imin == length(y_smooth)
-  is_valley <- is_valley && !at_boundary
+  is_valley <- is_valley && !at_boundary   # "!" means "not"
 
+  # Report the verdict, and the estimated change point only if it is a valley.
   list(is_valley = is_valley, tau_hat = if (is_valley) idx[imin] else NA_real_)
 }
 ```
@@ -343,41 +511,78 @@ find_valley <- function(idx, y_smooth, flat_tol = 1e-8) {
 :::
 
 ```{r smap_functions}
+#' S-map forecast: for each point we want to predict, fit a straight line
+#' through the library, but weight nearby library points much more heavily.
 smap_predict <- function(train_x, train_y, test_x, theta, k = NULL) {
-  E <- ncol(train_x)
-  if (is.null(k)) k <- E + 1
-  N <- nrow(train_x)
+  # train_x = library predictors (one row per library point, one column per lag)
+  # train_y = the value to be predicted for each library row
+  # test_x  = predictors for the points we want to forecast
+  # theta   = how sharply to down-weight distant points (0 = plain linear
+  #           regression; large = only the closest neighbours matter, i.e.
+  #           strongly nonlinear)
+  E <- ncol(train_x)                  # number of predictor columns
+  if (is.null(k)) k <- E + 1          # how many neighbours define "close"
+  N <- nrow(train_x)                  # number of library points
+
+  # Prepend a column of 1s: that column's coefficient becomes the intercept.
   Xtrain1 <- cbind(1, train_x)
-  preds <- numeric(nrow(test_x))
+  preds <- numeric(nrow(test_x))      # container for the forecasts
+
   for (i in seq_len(nrow(test_x))) {
-    xq <- test_x[i, ]
+    xq <- test_x[i, ]                 # the point we are forecasting ("query")
+
+    # Straight-line (Euclidean) distance from the query to every library
+    # point: subtract, square, sum across columns, take the square root.
     d <- sqrt(rowSums((train_x - matrix(xq, N, E, byrow = TRUE))^2))
+
+    # Average distance to the k closest library points -- used as a local
+    # yardstick so theta means the same thing in sparse and dense regions.
     dbar <- mean(sort(d)[seq_len(min(k, N))])
-    if (dbar <= 0) dbar <- 1e-8
+    if (dbar <= 0) dbar <- 1e-8       # avoid dividing by zero
+
+    # The S-map kernel: weight falls off exponentially with scaled distance.
     w <- exp(-theta * d / dbar)
+
+    # lm.wfit() = weighted least-squares fit, i.e. a local linear model.
     fit <- tryCatch(lm.wfit(x = Xtrain1, y = train_y, w = w), error = function(e) NULL)
+
+    # Apply that local line to the query point. If the fit failed or produced
+    # non-finite coefficients, record a missing value instead.
     preds[i] <- if (is.null(fit) || any(!is.finite(fit$coefficients))) NA_real_ else sum(c(1, xq) * fit$coefficients)
   }
   preds
 }
 
+#' Pick the theta that forecasts the test set best -- S-map's one tunable
+#' knob, the counterpart of the GP hyperparameters.
 fit_smap_theta <- function(train_x, train_y, test_x, test_y) {
+  # obj(theta) = the test-set RMSE we get with that theta. Lower is better.
   obj <- function(theta) sqrt(mean((test_y - smap_predict(train_x, train_y, test_x, theta))^2, na.rm = TRUE))
+  # optimize() searches the interval for the theta that minimises obj();
+  # $minimum extracts the winning theta itself.
   optimize(obj, interval = c(1e-4, 10))$minimum
 }
 
+#' The S-map version of fit_hyperparams(): the slow, once-per-n step.
 fit_hyperparams_smap <- function(lagdf, xnames, lib_start, lib_end, test_rows) {
+  # Slice out the library window and drop rows with missing values.
   train <- na.omit(lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, c("y", xnames)])
   test <- na.omit(test_rows[, c("y", xnames)])
+  # "||" means "or": give up if either set is too small to work with.
   if (nrow(train) < length(xnames) + 2 || nrow(test) == 0) return(NULL)
+  # as.matrix() converts the data frame to the plain numeric matrix that
+  # smap_predict() expects.
   list(theta = fit_smap_theta(as.matrix(train[, xnames]), train$y, as.matrix(test[, xnames]), test$y))
 }
 
+#' The S-map version of refit_fixed(): re-forecast with theta held fixed
+#' while the library shrinks, and report the test-set RMSE.
 refit_fixed_smap <- function(lagdf, xnames, lib_start, lib_end, test_rows, theta) {
   train <- na.omit(lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, c("y", xnames)])
   test <- na.omit(test_rows[, c("y", xnames)])
   if (nrow(train) < length(xnames) + 2 || nrow(test) == 0) return(NA_real_)
   p <- smap_predict(as.matrix(train[, xnames]), train$y, as.matrix(test[, xnames]), theta)
+  # RMSE: average the squared errors, then take the square root.
   sqrt(mean((test$y - p)^2, na.rm = TRUE))
 }
 
@@ -385,31 +590,41 @@ refit_fixed_smap <- function(lagdf, xnames, lib_start, lib_end, test_rows, theta
 #' structure, so the two methods are compared apples-to-apples).
 nla_left_smap <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
                            bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  # Step for step this is nla_left() above; only the forecaster differs, so
+  # see there for the detailed walk-through of the loop.
   lf <- build_lag_frame(y, E, tau)
   lagdf <- lf$lagdf; xnames <- lf$xnames
-  test_rows <- lagdf[lagdf$time >= (L + 1) & lagdf$time <= R, ]
-  n_seq <- seq(0, L - min_lib, by = Dskipstep)
+  test_rows <- lagdf[lagdf$time >= (L + 1) & lagdf$time <= R, ]  # test = late part
+  n_seq <- seq(0, L - min_lib, by = Dskipstep)                   # library start points
   tau_n <- rep(NA_real_, length(n_seq))
+
   for (i in seq_along(n_seq)) {
     n <- n_seq[i]
-    hp <- fit_hyperparams_smap(lagdf, xnames, max(1, n), L, test_rows)
+    hp <- fit_hyperparams_smap(lagdf, xnames, max(1, n), L, test_rows)  # fit theta once
     if (is.null(hp)) next
-    l_seq <- seq(n, L - min_lib, by = Dskipstep)
+    l_seq <- seq(n, L - min_lib, by = Dskipstep)                        # cut points
     if (length(l_seq) < 3) next
+    # Error curve: shrink the library, keeping theta frozen.
     err <- vapply(l_seq, function(l) refit_fixed_smap(lagdf, xnames, max(1, l), L, test_rows, hp$theta), numeric(1))
+    # Smooth, then take the bottom of the dip (NA if it isn't valley-shaped).
     v <- find_valley(l_seq, smooth_gaussian(l_seq, err, bandwidth))
     tau_n[i] <- v$tau_hat
   }
+  # Median across starting points = the single estimated change point.
+  # Median of the per-n candidates; NA if none of them found a valley.
   list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE))
 }
 
 nla_right_smap <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
                             bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  # Mirror image of nla_left_smap(), exactly as nla_right() mirrors nla_left():
+  # the test set is the early part and the library is trimmed from its late end.
   lf <- build_lag_frame(y, E, tau)
   lagdf <- lf$lagdf; xnames <- lf$xnames
-  test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]
-  n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)
+  test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]   # test = early part
+  n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)         # counts down
   tau_n <- rep(NA_real_, length(n_seq))
+
   for (i in seq_along(n_seq)) {
     n <- n_seq[i]
     hp <- fit_hyperparams_smap(lagdf, xnames, L + 1, n, test_rows)
@@ -420,6 +635,7 @@ nla_right_smap <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
     v <- find_valley(l_seq, smooth_gaussian(l_seq, err, bandwidth))
     tau_n[i] <- v$tau_hat
   }
+  # Median of the per-n candidates; NA if none of them found a valley.
   list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE))
 }
 ```
@@ -443,49 +659,75 @@ The food-chain system below (Huang et al. 2024's own benchmark) is deliberately 
 ```{r logistic_functions}
 #' Simulate the logistic map with an abrupt change in r (fixed point -> chaos).
 simulate_logistic <- function(Tmax = 300, cp = 150, r1 = 2.8, r2 = 3.9, sd = 0.01, seed = 1) {
+  # Tmax = series length, cp = when the shift happens,
+  # r1/r2 = growth rate before/after the shift, sd = observation-noise size.
+
+  # set.seed() makes the random numbers reproducible: same seed, same series.
   set.seed(seed)
-  x <- numeric(Tmax); x[1] <- 0.4
+
+  x <- numeric(Tmax)   # empty container of length Tmax (all zeros for now)
+  x[1] <- 0.4          # starting value
+
+  # Step the map forward one time unit at a time. Each new value depends only
+  # on the previous one -- that is what makes this a "dynamical system".
   for (t in 2:Tmax) {
-    r <- if (t < cp) r1 else r2
+    r <- if (t < cp) r1 else r2   # the regime shift: r jumps at time cp
+    # The logistic map, x_{t+1} = r * x_t * (1 - x_t). The min()/max() pair
+    # just clamps the value inside (0, 1) so rounding can't push it out.
     x[t] <- min(max(r * x[t - 1] * (1 - x[t - 1]), 1e-6), 1 - 1e-6)
   }
+
+  # rnorm() draws Tmax random numbers from a bell curve with mean 0: this is
+  # the measurement noise, added on top of the true trajectory.
   x + rnorm(Tmax, 0, sd)
 }
 ```
 
 ```{r fig-logistic-traj}
 #| fig-cap: "Logistic map: a stable fixed point (r=2.8) abruptly becomes chaotic (r=3.9) at t=150 (dashed line)."
-y_log <- simulate_logistic()
-cp_log <- 150
+y_log <- simulate_logistic()   # simulate with all the defaults above
+cp_log <- 150                  # the change point we built in, for reference
+
+# tibble() makes a small table; seq_along() gives 1, 2, ..., length(y_log).
 tibble(time = seq_along(y_log), x = y_log) %>%
   ggplot(aes(time, x)) +
-  geom_line() +
+  geom_line() +                                     # the trajectory
+  # A vertical marker at the true change point, for visual comparison.
   geom_vline(xintercept = cp_log, linetype = "dashed", color = "firebrick") +
   theme_minimal()
 ```
 
 ```{r tbl-logistic-result}
 #| tbl-cap: "NLA-GP vs. NLA-S-map on the logistic map: both land close to the true change point (t=150), in a few seconds each."
-T_log <- length(y_log)
+T_log <- length(y_log)   # how many time steps we have
+
+# Where to split library from test set. For the left check the library covers
+# the first 65% of the series (test = the last 35%); for the right check the
+# test set is the first 35% (library = the rest).
 Ll_log <- round(T_log * 0.65); Lr_log <- round(T_log * 0.35)
 
+# Sys.time() reads the clock: recording it before and after lets us time the
+# run, so we can compare how expensive the two methods are.
 t0 <- Sys.time()
 left_log_gp  <- nla_left(y_log,  L = Ll_log, R = T_log, E = 2, tau = 1, Dskipstep = 6, bandwidth = 12)
 right_log_gp <- nla_right(y_log, L = Lr_log, R = T_log, E = 2, tau = 1, Dskipstep = 6, bandwidth = 12)
-time_log_gp <- as.numeric(Sys.time() - t0, units = "secs")
+time_log_gp <- as.numeric(Sys.time() - t0, units = "secs")   # elapsed seconds
 
+# The same two checks, now with the original S-map forecaster.
 t0 <- Sys.time()
 left_log_sm  <- nla_left_smap(y_log,  L = Ll_log, R = T_log, E = 2, tau = 1, Dskipstep = 6, bandwidth = 12)
 right_log_sm <- nla_right_smap(y_log, L = Lr_log, R = T_log, E = 2, tau = 1, Dskipstep = 6, bandwidth = 12)
 time_log_sm <- as.numeric(Sys.time() - t0, units = "secs")
 
+# Assemble the results into a table. $tau_hat pulls the estimated change point
+# out of each result list; "Combined" is the median of the two checks.
 tibble(Method = c("NLA-GP", "NLA-S-map"),
        `Left check` = c(left_log_gp$tau_hat, left_log_sm$tau_hat),
        `Right check` = c(right_log_gp$tau_hat, right_log_sm$tau_hat),
        Combined = c(median(c(left_log_gp$tau_hat, right_log_gp$tau_hat), na.rm = TRUE),
                     median(c(left_log_sm$tau_hat, right_log_sm$tau_hat), na.rm = TRUE)),
        `Runtime (s)` = round(c(time_log_gp, time_log_sm), 1)) %>%
-  knitr::kable()
+  knitr::kable()   # render it as a formatted table in the HTML output
 ```
 
 **We conclude:** both methods land within ~15-25 points of the true change point (t=150) in a matter of seconds -- a useful sanity check that the implementation works before moving to a harder, more realistic benchmark.
@@ -535,19 +777,40 @@ We flag this rather than silently presenting these as the published values.
 :::
 
 ```{r foodchain_functions}
+#' The model's "right-hand side": given the current state, return the rate of
+#' change of each variable. deSolve calls this repeatedly to step the system
+#' forward in time. (t = current time, state = current values, params = fixed
+#' constants.)
 foodchain_rhs <- function(t, state, params) {
+  # with(as.list(...)) makes every entry of state and params usable by name
+  # (N, x, y, z, b, m, ...), so the equations below read like the maths.
   with(as.list(c(state, params)), {
-    a  <- c4 * t + c5
-    d1 <- c0 * N + c1
-    p1 <- c2 * N + c3
+    a  <- c4 * t + c5   # the external forcing on the nutrient: rises with time
+    d1 <- c0 * N + c1   # y's death rate -- increases with the nutrient N
+    p1 <- c2 * N + c3   # x's attack rate on ... -- also increases with N
+
+    # Nutrient: input a, losses proportional to N, plus a saturating recycling
+    # term. That last term is what creates the fold (tipping) bifurcation.
     dN <- a - b * N + c * N^m / (N^m + 1)
+
+    # x = prey: grows logistically, eaten by y.
+    # The p1*x*y/(1+q1*x) form is a saturating ("Holling type II") feeding rate.
     dx <- x * (1 - x) - p1 * x * y / (1 + q1 * x)
+
+    # y = mid-level consumer: dies at rate d1, gains from eating x, loses to z.
     dy <- -d1 * y + p1 * x * y / (1 + q1 * x) - p2 * y * z / (1 + q2 * y)
+
+    # z = top predator: dies at rate d2, gains from eating y.
     dz <- -d2 * z + p2 * y * z / (1 + q2 * y)
+
+    # deSolve requires the rates back as a list, in the same order as `state`.
     list(c(N = dN, x = dx, y = dy, z = dz))
   })
 }
 
+#' The fixed constants of the model, collected in one place (Huang et al. 2024,
+#' S3 Text Table A -- with the two deviations flagged in the callout above).
+#' c4 and c5 set the forcing ramp a(t) = c4*t + c5 and are left adjustable.
 default_fc_params <- function(c4 = 0.000867, c5 = 0.25) {
   list(b = 0.8, m = 8, c = 1, d2 = 0.01, c0 = 0.15, c1 = 0.4,
        c2 = 0.05, c3 = 3.7, q1 = 3.25, p2 = 0.1, q2 = 2, c4 = c4, c5 = c5)
@@ -558,22 +821,45 @@ default_fc_params <- function(c4 = 0.000867, c5 = 0.25) {
 simulate_foodchain <- function(Tmax = 1000, dt_sample = 1, lambda = 0.01, rho = 0.05,
                                 meas_sd = 0.05, state0 = c(N = 0.3, x = 0.5, y = 0.1, z = 9),
                                 params = default_fc_params(), seed = 1) {
-  set.seed(seed)
+  # lambda  = how often random shocks arrive, rho = how big they are
+  # meas_sd = size of the measurement noise added at the end
+  # state0  = starting abundances of N, x, y, z
+  set.seed(seed)   # reproducible randomness
+
+  # --- Process noise: occasional random shocks to the whole system ----------
+  # rpois() draws how MANY shocks occur (a Poisson count); runif() draws
+  # uniformly random times for them, which we sort into chronological order.
   n_events <- rpois(1, lambda * Tmax)
   event_times <- sort(runif(n_events, 1e-6, Tmax - 1e-6))
+
+  # One multiplier per variable per shock, drawn between 1-rho and 1+rho:
+  # e.g. with rho = 0.05, each abundance is nudged by up to +-5%.
   shocks <- matrix(runif(4 * n_events, 1 - rho, 1 + rho), ncol = 4)
+
+  # deSolve calls this at each shock time to modify the state on the spot.
   event_func <- function(t, state, params) {
-    i <- which(abs(event_times - t) < 1e-6)[1]
+    i <- which(abs(event_times - t) < 1e-6)[1]   # which shock is this?
+    # pmax(..., 1e-8) keeps abundances strictly positive after the nudge.
     if (!is.na(i)) state <- pmax(state * shocks[i, ], 1e-8)
     state
   }
-  samp_times <- seq(0, Tmax, by = dt_sample)
-  sol <- ode(y = state0, times = samp_times, func = foodchain_rhs, parms = params, method = "ode45",
+
+  # --- Solve the differential equations ------------------------------------
+  samp_times <- seq(0, Tmax, by = dt_sample)   # times we want output at
+  sol <- ode(y = state0, times = samp_times, func = foodchain_rhs, parms = params,
+             method = "ode45",   # a standard adaptive-step numerical solver
+             # Only pass the shock machinery if there are any shocks at all.
              events = if (n_events > 0) list(func = event_func, time = event_times) else NULL)
-  traj <- as.data.frame(sol)
-  traj <- traj[complete.cases(traj), ]
+
+  traj <- as.data.frame(sol)               # solver output -> tidy table
+  traj <- traj[complete.cases(traj), ]     # drop any rows the solver failed on
+
+  # --- Observation model ---------------------------------------------------
+  # z-score each variable (scale()) and add Gaussian measurement noise, so the
+  # series we analyse looks like imperfect field data rather than exact maths.
   for (v in c("N", "x", "y", "z")) traj[[v]] <- scale(traj[[v]])[, 1] + rnorm(nrow(traj), 0, meas_sd)
-  rownames(traj) <- NULL
+
+  rownames(traj) <- NULL   # cosmetic: renumber the rows 1, 2, 3, ...
   traj
 }
 
@@ -587,15 +873,20 @@ cp_true <- 300
 
 ```{r fig-foodchain-traj}
 #| fig-cap: "One simulated realization (Fig 2-style): z, y, x each depend directly on N, but only z visibly shifts in mean; the shift in x and y is a change in dynamical character (chaotic to near-periodic), not visible by eye. Dashed line: true change point (t=300)."
-traj <- simulate_foodchain(seed = 1)
+traj <- simulate_foodchain(seed = 1)   # one realization of the model
 
 traj %>%
-  select(time, z, y, x, N) %>%
+  select(time, z, y, x, N) %>%          # keep these columns, in this order
+  # pivot_longer() reshapes wide -> long: instead of four value columns we get
+  # one "variable" column and one "value" column. ggplot needs this shape to
+  # draw one panel per variable. "-time" means "all columns except time".
   pivot_longer(-time, names_to = "variable", values_to = "value") %>%
+  # factor(levels = ...) fixes the panel order (top predator first).
   mutate(variable = factor(variable, levels = c("z", "y", "x", "N"))) %>%
   ggplot(aes(time, value)) +
   geom_line() +
   geom_vline(xintercept = cp_true, linetype = "dashed", color = "firebrick") +
+  # One stacked panel per variable; free_y lets each use its own y-axis range.
   facet_wrap(~variable, ncol = 1, scales = "free_y") +
   labs(x = "Time", y = NULL) +
   theme_minimal()
@@ -606,31 +897,45 @@ traj %>%
 We first demonstrate NLA-GP on a single realization, cropping to a window around the shift for tractability (`t` in `[100, 600]`, so `cp_true` is at crop-index 201).
 
 ```{r run_synthetic_gp}
-E <- 3; tau <- 1; Dskipstep <- 15; bandwidth <- 30
+# Analysis settings, reused by every run in this section:
+E <- 3            # use 3 lagged values as predictors
+tau <- 1          # lags one step apart
+Dskipstep <- 15   # try every 15th cut point (coarser = faster)
+bandwidth <- 30   # smoothing width for the error curve
+
+# Crop to a window around the shift: the whole 1000-step series would be slow.
 crop <- traj[traj$time >= 100 & traj$time <= 600, ]
-T_syn <- nrow(crop)
-cp_true_crop <- cp_true - 99
-y_syn <- crop$y
+T_syn <- nrow(crop)          # length of the cropped series
+cp_true_crop <- cp_true - 99 # the true change point, renumbered for the crop
+y_syn <- crop$y              # the variable we analyse (shows no obvious shift)
+
+# Library/test split, as in the logistic example above.
 L_left <- round(T_syn * 0.65); L_right <- round(T_syn * 0.35)
 
-t0 <- Sys.time()
+t0 <- Sys.time()   # start the stopwatch
 left_gp  <- nla_left(y_syn,  L = L_left, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
 right_gp <- nla_right(y_syn, L = L_right, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
-time_gp <- as.numeric(Sys.time() - t0, units = "secs")
+time_gp <- as.numeric(Sys.time() - t0, units = "secs")   # elapsed seconds
+# Single answer from the two checks: their median (here, just their average).
 combined_gp <- median(c(left_gp$tau_hat, right_gp$tau_hat), na.rm = TRUE)
 
+# Side by side with the known truth, so the reader can judge the accuracy.
 tibble(estimate = c("True change point", "Left check", "Right check", "Combined"),
        value = c(cp_true_crop, left_gp$tau_hat, right_gp$tau_hat, combined_gp))
 ```
 
 ```{r fig-synthetic-curves}
 #| fig-cap: "Right-check NLA-GP error curves for a few outer starting points n. Grey: raw RMSE. Blue: smoothed. Dashed red: true change point."
+# Plotting all the outer starting points would be unreadable, so pick 4 of
+# them, evenly spaced: list the unique n values, sort them, and take the
+# 1st, ~1/3, ~2/3 and last. ("." is the value flowing through the pipe.)
 n_show <- unique(right_gp$curves$n) %>% sort() %>% { .[round(seq(1, length(.), length.out = 4))] }
+
 right_gp$curves %>%
-  filter(n %in% n_show) %>%
+  filter(n %in% n_show) %>%      # keep only those 4 starting points
   ggplot(aes(l, rmse)) +
-  geom_point(color = "grey60", size = 1) +
-  geom_line(aes(y = rmse_smooth), color = "steelblue", linewidth = 0.8) +
+  geom_point(color = "grey60", size = 1) +                                  # raw error
+  geom_line(aes(y = rmse_smooth), color = "steelblue", linewidth = 0.8) +   # smoothed
   geom_vline(xintercept = cp_true_crop, linetype = "dashed", color = "firebrick") +
   facet_wrap(~n, labeller = label_both) +
   labs(x = "Library start l", y = "Out-of-sample RMSE") +
@@ -642,6 +947,8 @@ right_gp$curves %>%
 We use the original NLA-S-map, defined in the Algorithm/Code section above, on the same cropped window.
 
 ```{r run_synthetic_smap}
+# Exactly the same inputs and settings as the GP run above -- only the
+# forecaster differs -- so the comparison is like for like.
 t0 <- Sys.time()
 left_sm  <- nla_left_smap(y_syn,  L = L_left, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
 right_sm <- nla_right_smap(y_syn, L = L_right, R = T_syn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
@@ -658,6 +965,7 @@ tibble(Method = c("NLA-GP", "NLA-S-map"),
        `Left check` = c(left_gp$tau_hat, left_sm$tau_hat),
        `Right check` = c(right_gp$tau_hat, right_sm$tau_hat),
        Combined = c(combined_gp, combined_sm),
+       # abs() = distance from the truth regardless of direction (early or late).
        `Error (vs. true)` = round(abs(c(combined_gp, combined_sm) - cp_true_crop)),
        `Runtime (s)` = round(c(time_gp, time_sm), 1)) %>%
   knitr::kable()
@@ -672,26 +980,35 @@ A single realization isn't a reliable performance measure (Huang et al. 2024 use
 :::
 
 ```{r run_replicates}
-N_REPLICATES <- 20
+N_REPLICATES <- 20   # how many independent simulated datasets to score
 
+#' Everything done above for one dataset, wrapped up so we can repeat it. The
+#' seed both identifies the replicate and gives it its own noise draw.
 run_one_replicate <- function(seed) {
-  tr <- simulate_foodchain(seed = seed)
-  cr <- tr[tr$time >= 100 & tr$time <= 600, ]
-  y <- cr$y
+  tr <- simulate_foodchain(seed = seed)     # a fresh simulated dataset
+  cr <- tr[tr$time >= 100 & tr$time <= 600, ]  # same crop window as before
+  y <- cr$y                                 # same variable
   Tn <- nrow(cr)
-  Ll <- round(Tn * 0.65); Lr <- round(Tn * 0.35)
+  Ll <- round(Tn * 0.65); Lr <- round(Tn * 0.35)   # same library/test split
 
+  # All four runs: GP and S-map, left check and right check.
   lg <- nla_left(y,  L = Ll, R = Tn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
   rg <- nla_right(y, L = Lr, R = Tn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
   ls <- nla_left_smap(y,  L = Ll, R = Tn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
   rs <- nla_right_smap(y, L = Lr, R = Tn, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
 
+  # One row of results for this replicate: each method's combined estimate.
   tibble(seed = seed,
          `NLA-GP` = median(c(lg$tau_hat, rg$tau_hat), na.rm = TRUE),
          `NLA-S-map` = median(c(ls$tau_hat, rs$tau_hat), na.rm = TRUE))
 }
 
+# map_dfr() runs the function for seeds 1..N and stacks the one-row results
+# into a single data frame. This is the slow chunk: expect several minutes.
 replicate_results <- map_dfr(seq_len(N_REPLICATES), run_one_replicate)
+
+# Reshape to one row per (replicate, method), which is what the summary table
+# and the plots below expect.
 replicate_long <- replicate_results %>%
   pivot_longer(-seed, names_to = "Method", values_to = "tau_hat")
 ```
@@ -699,18 +1016,26 @@ replicate_long <- replicate_results %>%
 ```{r tbl-replicate-summary}
 #| tbl-cap: "NLA-GP vs. NLA-S-map across replicate simulations: detection rate, median estimate, and error relative to the true change point (crop-index 201)."
 replicate_long %>%
-  group_by(Method) %>%
-  summarise(`Detected (n)` = sum(!is.na(tau_hat)),
-            `Detected (%)` = round(100 * mean(!is.na(tau_hat))),
-            `Median estimate` = median(tau_hat, na.rm = TRUE),
-            `Median error` = median(abs(tau_hat - cp_true_crop), na.rm = TRUE),
-            .groups = "drop") %>%
+  group_by(Method) %>%   # compute the following separately for each method
+  summarise(
+    # !is.na(tau_hat) is TRUE when a change point WAS found. Summing TRUEs
+    # counts them; averaging them gives the proportion.
+    `Detected (n)` = sum(!is.na(tau_hat)),
+    `Detected (%)` = round(100 * mean(!is.na(tau_hat))),
+    # Typical estimate, and typical distance from the truth. We use medians
+    # (not means) so one wild replicate can't dominate the summary.
+    `Median estimate` = median(tau_hat, na.rm = TRUE),
+    `Median error` = median(abs(tau_hat - cp_true_crop), na.rm = TRUE),
+    .groups = "drop") %>%   # ungroup afterwards, to avoid surprises later
   knitr::kable()
 ```
 
 ```{r fig-replicate-density}
 #| fig-cap: "Distribution of detected change points across replicates (Fig 4-style, left panel). Dashed red: true change point."
+# filter(!is.na(...)) keeps only the replicates where a change point was found.
 ggplot(replicate_long %>% filter(!is.na(tau_hat)), aes(tau_hat, fill = Method)) +
+  # Histogram: bars count how many replicates landed in each range.
+  # position = "identity" + alpha = 0.5 overlays the two methods semi-transparently.
   geom_histogram(position = "identity", alpha = 0.5, bins = 15) +
   geom_vline(xintercept = cp_true_crop, linetype = "dashed", color = "firebrick") +
   labs(x = "Detected change point", y = "Count") +
@@ -720,6 +1045,9 @@ ggplot(replicate_long %>% filter(!is.na(tau_hat)), aes(tau_hat, fill = Method)) 
 ```{r fig-replicate-ecdf}
 #| fig-cap: "Empirical cumulative distribution of detected change points (Fig 4-style, right panel). Dashed red: true change point."
 ggplot(replicate_long %>% filter(!is.na(tau_hat)), aes(tau_hat, color = Method)) +
+  # stat_ecdf() draws the empirical cumulative distribution: at each x it shows
+  # the fraction of replicates that estimated a change point at or before x.
+  # A curve that jumps steeply near the true value = tightly clustered estimates.
   stat_ecdf(linewidth = 0.8) +
   geom_vline(xintercept = cp_true_crop, linetype = "dashed", color = "firebrick") +
   labs(x = "Detected change point", y = "Cumulative count (fraction)") +

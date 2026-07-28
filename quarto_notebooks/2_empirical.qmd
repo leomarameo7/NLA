@@ -27,10 +27,11 @@ editor_options:
 ---
 
 ```{r load_libraries}
-library(GPEDM)
-library(tidyverse)
-library(here)
-library(zoo)
+# --- Packages used in this notebook -----------------------------------------
+library(GPEDM)     # Gaussian Process EDM: fitGP() and makelags()
+library(tidyverse) # data wrangling + plotting (dplyr, tidyr, ggplot2, purrr)
+library(here)      # file paths relative to the project root
+library(zoo)       # time-series helpers: na.approx() and rollmean() below
 ```
 
 ::: callout-important
@@ -39,13 +40,27 @@ This notebook applies **NLA-GP** to real data: Lake Zurich plankton (Medeiros et
 
 ## Code
 
+::: {.callout-tip title="Question"}
+What exactly is being re-run here, and why repeat it instead of loading it from `1_implement.qmd`?
+:::
+
+::: {.callout-note appearance="minimal"}
+**Answer:** this is the same NLA-GP and NLA-S-map implementation, copied verbatim so this notebook renders standalone -- nothing new is introduced. The comments below are a condensed reminder; `1_implement.qmd` has the full line-by-line walk-through and the reasoning behind the design (especially why the data is z-scored exactly once).
+:::
+
 ```{r core_functions}
+# NOTE: every function in this chunk is copied verbatim from `1_implement.qmd`,
+# so this notebook runs on its own. See that notebook for the full, line-by-line
+# walk-through; the comments here are a condensed reminder of what each does.
+
 #' Gaussian-kernel smoothing of an error curve (the paper's "Gaussian filter").
 smooth_gaussian <- function(idx, y, bandwidth) {
-  keep <- is.finite(y)
-  if (sum(keep) < 3) return(rep(NA_real_, length(y)))
+  keep <- is.finite(y)   # usable points only (no NA / NaN / Inf)
+  if (sum(keep) < 3) return(rep(NA_real_, length(y)))   # too little to smooth
   out <- rep(NA_real_, length(y))
   xi <- idx[keep]; yi <- y[keep]
+  # At each position, take a weighted average of all values, with bell-shaped
+  # weights so nearby points count most and distant ones barely at all.
   for (i in seq_along(idx)) {
     w <- exp(-0.5 * ((xi - idx[i]) / bandwidth)^2)
     out[i] <- sum(w * yi) / sum(w)
@@ -60,18 +75,22 @@ find_valley <- function(idx, y_smooth, flat_tol = 1e-8) {
   ok <- is.finite(y_smooth)
   if (sum(ok) < 3) return(list(is_valley = FALSE, tau_hat = NA_real_))
   idx <- idx[ok]; y_smooth <- y_smooth[ok]
-  o <- order(idx); idx <- idx[o]; y_smooth <- y_smooth[o]
+  o <- order(idx); idx <- idx[o]; y_smooth <- y_smooth[o]   # sort left to right
 
-  d <- diff(y_smooth)
+  d <- diff(y_smooth)   # step-to-step changes: negative = falling, positive = rising
+  # Treat negligible wiggles as exactly flat, so numerical dust isn't read as a move.
   scale_ <- max(abs(y_smooth), flat_tol)
   s <- ifelse(abs(d) < flat_tol * scale_, 0, sign(d))
   s_nz <- s[s != 0]
   if (length(s_nz) < 2) return(list(is_valley = FALSE, tau_hat = NA_real_))
 
+  # rle() collapses repeats: a true valley is exactly one falling run followed
+  # by one rising run, i.e. c(-1, 1). Anything else is rejected.
   runs <- rle(s_nz)$values
   is_valley <- length(runs) == 2 && identical(runs, c(-1, 1))
 
-  imin <- which.min(y_smooth)
+  imin <- which.min(y_smooth)   # position of the bottom of the dip
+  # Reject a minimum sitting at either end: we never saw the error turn back up.
   at_boundary <- imin == 1 || imin == length(y_smooth)
   is_valley <- is_valley && !at_boundary
 
@@ -83,9 +102,13 @@ find_valley <- function(idx, y_smooth, flat_tol = 1e-8) {
 build_lag_frame <- function(y, E, tau) {
   T <- length(y)
   base <- data.frame(time = seq_len(T), y = y)
+  # makelags() adds the "value E steps ago" predictor columns -- the time-delay
+  # embedding that stands in for the system's unobserved state.
   lagdf <- makelags(data = base, y = "y", E = E, tau = tau, append = TRUE)
-  xnames <- setdiff(names(lagdf), c("time", "y"))
+  xnames <- setdiff(names(lagdf), c("time", "y"))   # the predictor column names
 
+  # z-score everything ONCE, using only the rows with no missing values, so the
+  # scale stays fixed as the library shrinks later on.
   complete <- stats::complete.cases(lagdf[, c("y", xnames)])
   ymean <- mean(lagdf$y[complete]); ysd <- sd(lagdf$y[complete])
   lagdf$y <- (lagdf$y - ymean) / ysd
@@ -96,56 +119,74 @@ build_lag_frame <- function(y, E, tau) {
   list(lagdf = lagdf, xnames = xnames)
 }
 
+#' Stage 1 (slow): fit the GP hyperparameters on this library.
 fit_hyperparams <- function(lagdf, xnames, lib_start, lib_end, test_rows) {
-  train <- lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, ]
+  train <- lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, ]   # library rows
+  # tryCatch returns NULL instead of crashing if the optimiser fails.
   tryCatch(
+    # scaling = "none": we already standardised, in build_lag_frame().
     fitGP(data = train, y = "y", x = xnames, scaling = "none", newdata = test_rows),
     error = function(e) NULL
   )
 }
 
+#' Stage 2 (fast): refit on a smaller library with those hyperparameters frozen,
+#' and return the test-set RMSE (lower = better forecast).
 refit_fixed <- function(lagdf, xnames, lib_start, lib_end, test_rows, fixedpars) {
   train <- lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, ]
+  # Not enough usable rows to fit? Report a missing value rather than a bad fit.
   if (nrow(na.omit(train[, c("y", xnames)])) < length(xnames) + 2) return(NA_real_)
   fit <- tryCatch(
+    # fixedpars skips the slow hyperparameter search entirely.
     fitGP(data = train, y = "y", x = xnames, scaling = "none",
           fixedpars = fixedpars, newdata = test_rows),
     error = function(e) NULL
   )
   if (is.null(fit)) return(NA_real_)
-  unname(fit$outsampfitstats["rmse"])
+  unname(fit$outsampfitstats["rmse"])   # out-of-sample error, label stripped
 }
 
 #' Left check (Algorithm 1): library = y[1:L], test = y[(L+1):R].
 nla_left <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
                       bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  # L = last library time step; Dskipstep = search every Dskipstep-th cut point;
+  # bandwidth = smoothing width; min_lib = smallest library worth fitting.
   lf <- build_lag_frame(y, E, tau)
   lagdf <- lf$lagdf; xnames <- lf$xnames
-  test_rows <- lagdf[lagdf$time >= (L + 1) & lagdf$time <= R, ]
+  test_rows <- lagdf[lagdf$time >= (L + 1) & lagdf$time <= R, ]   # test = late part
 
-  n_seq <- seq(0, L - min_lib, by = Dskipstep)
-  tau_n <- rep(NA_real_, length(n_seq))
-  curves <- vector("list", length(n_seq))
+  n_seq <- seq(0, L - min_lib, by = Dskipstep)   # outer library starting points
+  tau_n <- rep(NA_real_, length(n_seq))          # one candidate change point per n
+  curves <- vector("list", length(n_seq))        # error curves, kept for plotting
 
+  # ---- One pass per starting point n --------------------------------------
   for (i in seq_along(n_seq)) {
     n <- n_seq[i]
-    lib_start_n <- max(1, n)
-    hp <- fit_hyperparams(lagdf, xnames, lib_start_n, L, test_rows)
-    if (is.null(hp)) next
+    lib_start_n <- max(1, n)   # n may be 0, but row numbers start at 1
+
+    hp <- fit_hyperparams(lagdf, xnames, lib_start_n, L, test_rows)  # slow, once
+    if (is.null(hp)) next      # the fit failed -> skip to the next n
+    # The hyperparameters to freeze: one per predictor, plus two variance terms.
     fixedpars <- hp$pars[seq_len(length(xnames) + 2)]
 
-    l_seq <- seq(n, L - min_lib, by = Dskipstep)
-    if (length(l_seq) < 3) next
+    l_seq <- seq(n, L - min_lib, by = Dskipstep)   # inner cut points
+    if (length(l_seq) < 3) next                    # too short to show a valley
+
+    # The error curve: forecast skill as the library is trimmed step by step.
     err <- vapply(l_seq, function(l) {
       refit_fixed(lagdf, xnames, max(1, l), L, test_rows, fixedpars)
     }, numeric(1))
 
+    # Smooth it, then take the bottom of the dip -- or NA if it's not a valley.
     y_smooth <- smooth_gaussian(l_seq, err, bandwidth)
     v <- find_valley(l_seq, y_smooth)
     tau_n[i] <- v$tau_hat
     curves[[i]] <- data.frame(n = n, l = l_seq, rmse = err, rmse_smooth = y_smooth)
   }
 
+  # Final answer = median of the per-n candidates (robust to the odd wild one);
+  # NA if no starting point produced a valley at all. We also return the raw
+  # per-n estimates and all the error curves (stacked with rbind) for plotting.
   list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE),
        tau_n = data.frame(n = n_seq, tau_hat = tau_n),
        curves = do.call(rbind, curves))
@@ -154,21 +195,24 @@ nla_left <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
 #' Right check (Algorithm 2): test = y[1:L], library = y[(L+1):R].
 nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
                        bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
+  # Mirror image of nla_left(): the test set is now the EARLY part of the
+  # series, and the library (rows L+1..R) is trimmed from its LATE end.
   lf <- build_lag_frame(y, E, tau)
   lagdf <- lf$lagdf; xnames <- lf$xnames
-  test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]
+  test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]   # test = early part
 
-  n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)
+  n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)   # note: counts DOWN
   tau_n <- rep(NA_real_, length(n_seq))
   curves <- vector("list", length(n_seq))
 
   for (i in seq_along(n_seq)) {
     n <- n_seq[i]
+    # Library start is pinned at L+1; its END (n) is what varies.
     hp <- fit_hyperparams(lagdf, xnames, L + 1, n, test_rows)
     if (is.null(hp)) next
     fixedpars <- hp$pars[seq_len(length(xnames) + 2)]
 
-    l_seq <- seq(n, L + 1 + min_lib, by = -Dskipstep)
+    l_seq <- seq(n, L + 1 + min_lib, by = -Dskipstep)   # trim the right edge
     if (length(l_seq) < 3) next
     err <- vapply(l_seq, function(l) {
       refit_fixed(lagdf, xnames, L + 1, l, test_rows, fixedpars)
@@ -180,6 +224,9 @@ nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
     curves[[i]] <- data.frame(n = n, l = l_seq, rmse = err, rmse_smooth = y_smooth)
   }
 
+  # Final answer = median of the per-n candidates (robust to the odd wild one);
+  # NA if no starting point produced a valley at all. We also return the raw
+  # per-n estimates and all the error curves (stacked with rbind) for plotting.
   list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE),
        tau_n = data.frame(n = n_seq, tau_hat = tau_n),
        curves = do.call(rbind, curves))
@@ -189,61 +236,79 @@ nla_right <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
 The original NLA-S-map (Huang et al. 2024's S2 Text) is reproduced too, so we can compare it against NLA-GP on the PDO test below, as we did on synthetic data in `1_implement.qmd`.
 
 ```{r smap_functions}
+#' S-map forecast: predict each test point with a straight line fitted through
+#' the library, weighting nearby library points far more heavily than distant
+#' ones. theta controls how sharp that down-weighting is (0 = plain linear
+#' regression; large = strongly local, i.e. nonlinear).
 smap_predict <- function(train_x, train_y, test_x, theta, k = NULL) {
-  E <- ncol(train_x)
-  if (is.null(k)) k <- E + 1
-  N <- nrow(train_x)
-  Xtrain1 <- cbind(1, train_x)
+  E <- ncol(train_x)             # number of predictor columns
+  if (is.null(k)) k <- E + 1     # how many neighbours count as "close"
+  N <- nrow(train_x)             # number of library points
+  Xtrain1 <- cbind(1, train_x)   # leading 1s column -> gives us an intercept
   preds <- numeric(nrow(test_x))
+
   for (i in seq_len(nrow(test_x))) {
-    xq <- test_x[i, ]
+    xq <- test_x[i, ]            # the point being forecast
+    # Euclidean distance from xq to every library point.
     d <- sqrt(rowSums((train_x - matrix(xq, N, E, byrow = TRUE))^2))
+    # Local yardstick: mean distance to the k nearest library points.
     dbar <- mean(sort(d)[seq_len(min(k, N))])
-    if (dbar <= 0) dbar <- 1e-8
-    w <- exp(-theta * d / dbar)
+    if (dbar <= 0) dbar <- 1e-8  # never divide by zero
+    w <- exp(-theta * d / dbar)  # the S-map kernel weights
+    # Weighted least squares = a local linear model around this query point.
     fit <- tryCatch(lm.wfit(x = Xtrain1, y = train_y, w = w), error = function(e) NULL)
     preds[i] <- if (is.null(fit) || any(!is.finite(fit$coefficients))) NA_real_ else sum(c(1, xq) * fit$coefficients)
   }
   preds
 }
 
+#' Pick the theta with the best test-set forecast: S-map's single tunable knob,
+#' the counterpart of the GP hyperparameters.
 fit_smap_theta <- function(train_x, train_y, test_x, test_y) {
   obj <- function(theta) sqrt(mean((test_y - smap_predict(train_x, train_y, test_x, theta))^2, na.rm = TRUE))
-  optimize(obj, interval = c(1e-4, 10))$minimum
+  optimize(obj, interval = c(1e-4, 10))$minimum   # the theta minimising the error
 }
 
+#' Stage 1 for S-map (slow, once per starting point): estimate theta.
 fit_hyperparams_smap <- function(lagdf, xnames, lib_start, lib_end, test_rows) {
   train <- na.omit(lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, c("y", xnames)])
   test <- na.omit(test_rows[, c("y", xnames)])
-  if (nrow(train) < length(xnames) + 2 || nrow(test) == 0) return(NULL)
+  if (nrow(train) < length(xnames) + 2 || nrow(test) == 0) return(NULL)   # too little data
   list(theta = fit_smap_theta(as.matrix(train[, xnames]), train$y, as.matrix(test[, xnames]), test$y))
 }
 
+#' Stage 2 for S-map (fast): re-forecast on a smaller library with theta frozen,
+#' and report the test-set RMSE.
 refit_fixed_smap <- function(lagdf, xnames, lib_start, lib_end, test_rows, theta) {
   train <- na.omit(lagdf[lagdf$time >= lib_start & lagdf$time <= lib_end, c("y", xnames)])
   test <- na.omit(test_rows[, c("y", xnames)])
   if (nrow(train) < length(xnames) + 2 || nrow(test) == 0) return(NA_real_)
   p <- smap_predict(as.matrix(train[, xnames]), train$y, as.matrix(test[, xnames]), theta)
-  sqrt(mean((test$y - p)^2, na.rm = TRUE))
+  sqrt(mean((test$y - p)^2, na.rm = TRUE))   # root mean squared error
 }
 
+#' Right check with S-map instead of GP-EDM -- structurally identical to
+#' nla_right() above, so the two methods can be compared like for like.
 nla_right_smap <- function(y, L, R = length(y), E = 3, tau = 1, Dskipstep = 5,
                             bandwidth = 2 * Dskipstep, min_lib = E * tau + 3) {
   lf <- build_lag_frame(y, E, tau)
   lagdf <- lf$lagdf; xnames <- lf$xnames
-  test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]
-  n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)
+  test_rows <- lagdf[lagdf$time >= 1 & lagdf$time <= L, ]   # test = early part
+  n_seq <- seq(R, L + 1 + min_lib, by = -Dskipstep)         # counts down
   tau_n <- rep(NA_real_, length(n_seq))
+
   for (i in seq_along(n_seq)) {
     n <- n_seq[i]
-    hp <- fit_hyperparams_smap(lagdf, xnames, L + 1, n, test_rows)
+    hp <- fit_hyperparams_smap(lagdf, xnames, L + 1, n, test_rows)   # fit theta once
     if (is.null(hp)) next
-    l_seq <- seq(n, L + 1 + min_lib, by = -Dskipstep)
+    l_seq <- seq(n, L + 1 + min_lib, by = -Dskipstep)                # cut points
     if (length(l_seq) < 3) next
+    # Error curve with theta held fixed while the library shrinks.
     err <- vapply(l_seq, function(l) refit_fixed_smap(lagdf, xnames, L + 1, l, test_rows, hp$theta), numeric(1))
-    v <- find_valley(l_seq, smooth_gaussian(l_seq, err, bandwidth))
+    v <- find_valley(l_seq, smooth_gaussian(l_seq, err, bandwidth))  # smooth, then find the dip
     tau_n[i] <- v$tau_hat
   }
+  # Median of the per-n candidates; NA if none of them found a valley.
   list(tau_hat = if (all(is.na(tau_n))) NA_real_ else median(tau_n, na.rm = TRUE))
 }
 ```
@@ -283,21 +348,33 @@ zurich_long_names <- c(
 #' monthly time index, linearly interpolates the handful of scattered
 #' single-month gaps, and z-scores each variable.
 process_zurich_data <- function(path) {
-  z <- read.csv(path)
-  z <- z[order(z$year, z$month), ]
-  z$time_idx <- seq_len(nrow(z))
+  z <- read.csv(path)                 # read the raw comma-separated file
+  z <- z[order(z$year, z$month), ]    # sort into chronological order
+  z$time_idx <- seq_len(nrow(z))      # 1, 2, 3, ... = position in the series
+  # sprintf() glues year and month into "1977-04-01", which as.Date() turns
+  # into a real date R can plot on a time axis. %02d pads months to two digits.
   z$date <- as.Date(sprintf("%d-%02d-01", z$year, z$month))
 
+  # The 13 plankton groups = everything named except the two environmental
+  # variables (setdiff() is set subtraction).
   plankton_vars <- setdiff(names(zurich_long_names), c("temperature", "phosphorus"))
+
+  # na.approx() fills gaps by drawing a straight line between the observations
+  # on either side. Only a handful of single months are missing.
   for (v in c(plankton_vars, "temperature", "phosphorus")) {
     z[[v]] <- na.approx(z[[v]], x = z$time_idx, na.rm = FALSE)
   }
+  # Drop any rows still incomplete (gaps at the very start or end can't be
+  # interpolated, since there is nothing on one side to interpolate from).
   z <- z[complete.cases(z[, plankton_vars]), ]
 
+  # z-score each group into a new "scaled_..." column, so all 13 are on a
+  # comparable scale (mean 0, sd 1) regardless of how abundant they are.
   for (v in plankton_vars) {
     z[[paste0("scaled_", v)]] <- as.numeric(scale(z[[v]]))
   }
-  z$time_idx <- seq_len(nrow(z))
+
+  z$time_idx <- seq_len(nrow(z))   # renumber, since rows may have been dropped
   rownames(z) <- NULL
   z
 }
@@ -305,9 +382,11 @@ process_zurich_data <- function(path) {
 #' Row index closest to a given year-month, for marking reference dates.
 zurich_month_index <- function(z, year, month) {
   target <- as.Date(sprintf("%d-%02d-01", year, month))
+  # which.min(abs(...)) = the row whose date is nearest to the target date.
   which.min(abs(z$date - target))
 }
 
+# here() builds the path from the project root, so this works on any machine.
 z <- process_zurich_data(here("data", "raw", "lake_zurich.csv"))
 ```
 
@@ -315,6 +394,10 @@ z <- process_zurich_data(here("data", "raw", "lake_zurich.csv"))
 
 ```{r tbl-medeiros-s1}
 #| tbl-cap: "Medeiros et al. 2025, Table S1: change-point analysis for all 13 Lake Zurich functional groups. SS ratio: lower means stronger evidence of a shift (the 3 lowest are their clearest cases)."
+# tribble() writes a small table row by row, which is easier to read than a
+# column-wise data.frame(). The "~" marks the column names. These numbers are
+# transcribed from Medeiros et al. 2025's published Table S1 -- they are their
+# results, not ours, and serve as the reference we compare NLA-GP against.
 table_s1 <- tribble(
   ~code, ~Group,                     ~`TP month`, ~`SS ratio`, ~Phosphate,
   "Cr2", "Cryptophytes (large)",      "1996-02",    0.940,       0.024,
@@ -331,55 +414,82 @@ table_s1 <- tribble(
   "Mi",  "Mixotrophic flagellates",   "1996-03",    0.931,       0.024,
   "Om",  "Omnivores",                 "1986-06",    0.903,       0.055
 )
+# Drop the short code column (we only need it in the code, not the display),
+# sort by SS ratio so the strongest evidence sits at the top, and render.
 table_s1 %>% select(-code) %>% arrange(`SS ratio`) %>% knitr::kable()
 ```
 
 ## Results
 
 ```{r run_zurich_all}
-E <- 3; tau <- 1; Dskipstep <- 16; bandwidth <- 32
-L_left <- 200; L_right <- 60
-T_z <- nrow(z)
+# Analysis settings, shared by all 13 groups:
+E <- 3            # 3 lagged values as predictors
+tau <- 1          # lags one month apart
+Dskipstep <- 16   # try every 16th cut point (16 months) -- coarser = faster
+bandwidth <- 32   # smoothing width for the error curve
 
+# Library/test split, in months. Left check: library = the first 200 months,
+# test = everything after. Right check: test = the first 60 months.
+L_left <- 200; L_right <- 60
+T_z <- nrow(z)    # total number of months in the series
+
+# pmap() walks table_s1 row by row, handing each row's columns to the function
+# below as named arguments -- so this runs the whole analysis once per group.
 zurich_results <- pmap(table_s1, function(code, Group, `TP month`, `SS ratio`, Phosphate) {
-  y <- z[[paste0("scaled_", code)]]
+  y <- z[[paste0("scaled_", code)]]   # this group's z-scored abundance series
+
+  # Split Medeiros et al.'s date "1996-02" into year and month, and find the
+  # matching row, so their answer is on the same index scale as ours.
   ym <- as.integer(strsplit(`TP month`, "-")[[1]])
   ref_idx <- zurich_month_index(z, ym[1], ym[2])
+
+  # The two NLA checks: one looking for an early shift, one for a late shift.
   left <- nla_left(y, L = L_left, R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
   right <- nla_right(y, L = L_right, R = T_z, E = E, tau = tau, Dskipstep = Dskipstep, bandwidth = bandwidth)
-  combined <- median(c(left$tau_hat, right$tau_hat), na.rm = TRUE)
+  combined <- median(c(left$tau_hat, right$tau_hat), na.rm = TRUE)   # single answer
   tibble(code = code, Group = Group, `Medeiros date` = `TP month`, `SS ratio` = `SS ratio`,
          `NLA-GP left` = left$tau_hat, `NLA-GP right` = right$tau_hat,
          `NLA-GP combined` = combined,
+         # Translate our row-index answer back into a calendar date, so it can
+         # be read against Medeiros et al.'s date directly.
          `NLA-GP date` = if (is.na(combined)) NA_character_ else format(z$date[round(combined)], "%Y-%m"))
 })
 ```
 
 ```{r tbl-zurich-summary}
 #| tbl-cap: "NLA-GP detected change points vs. Medeiros et al. 2025 (Table S1), all 13 Lake Zurich functional groups, using the full 1977-2020 series and z-scored (not log-transformed) abundance."
+# pmap() returned a list of one-row tables; bind_rows() stacks them into one.
 zurich_summary <- bind_rows(zurich_results) %>% arrange(`SS ratio`)
-knitr::kable(zurich_summary %>% select(-code))
+knitr::kable(zurich_summary %>% select(-code))   # hide the short code column
 ```
 
 ```{r fig-zurich-nla-vs-medeiros}
 #| fig-cap: "Lake Zurich functional groups (z-scored abundance) with Medeiros et al. 2025's change point (red) and NLA-GP's combined estimate (blue)."
 #| fig-height: 12
+# Reshape the 13 scaled columns into long form: one row per (date, group),
+# which is the shape ggplot needs to draw one panel per group.
 long_ts <- z %>%
-  select(date, starts_with("scaled_")) %>%
+  select(date, starts_with("scaled_")) %>%            # date + the 13 scaled columns
   pivot_longer(-date, names_to = "code", values_to = "value") %>%
-  mutate(code = str_remove(code, "^scaled_")) %>%
+  mutate(code = str_remove(code, "^scaled_")) %>%     # "scaled_Cy" -> "Cy"
+  # left_join() attaches the readable group name by matching on the code.
   left_join(table_s1 %>% select(code, Group), by = "code")
 
+# The two change-point dates to draw on each panel. Pasting "-01" onto
+# "1996-02" makes a full date R can place on the time axis.
 lines_df <- zurich_summary %>%
   mutate(medeiros_date = as.Date(paste0(`Medeiros date`, "-01")),
+         # if_else() guards the groups where NLA-GP found nothing (NA).
          nla_date = if_else(is.na(`NLA-GP date`), as.Date(NA), as.Date(paste0(`NLA-GP date`, "-01"))))
 
 ggplot(long_ts, aes(date, value)) +
-  geom_line(linewidth = 0.3, color = "grey30") +
+  geom_line(linewidth = 0.3, color = "grey30") +      # the observed series
+  # Two sets of vertical markers, drawn from lines_df rather than long_ts.
+  # Naming the colour inside aes() is what makes the legend appear.
   geom_vline(data = lines_df, aes(xintercept = medeiros_date, color = "Medeiros"), linetype = "dashed") +
   geom_vline(data = lines_df %>% filter(!is.na(nla_date)),
              aes(xintercept = nla_date, color = "NLA-GP"), linetype = "dashed") +
-  facet_wrap(~Group, ncol = 3, scales = "free_y") +
+  facet_wrap(~Group, ncol = 3, scales = "free_y") +   # one panel per group
   scale_color_manual(values = c(Medeiros = "firebrick", `NLA-GP` = "steelblue"), name = NULL) +
   labs(x = NULL, y = "z-scored abundance") +
   theme_minimal() +
@@ -407,24 +517,40 @@ Huang et al. 2024 (Sec. 3.2) applied the original NLA-S-map to the Pacific Decad
 - Compare NLA-GP and NLA-S-map's detected change point to their reported ~1973
 
 ```{r pdo_functions}
+# skip = 1 ignores the file's first line, which is a header comment, not data.
 pdo <- read.csv(here("data", "raw", "pdo.csv"), skip = 1)
+
+# The Date column looks like "187501" (YYYYMM). substr() cuts out the pieces:
+# characters 1-4 are the year, characters 5-6 the month.
 pdo$year <- as.integer(substr(pdo$Date, 1, 4))
 pdo$month <- as.integer(substr(pdo$Date, 5, 6))
-pdo <- pdo[pdo$year >= 1875 & pdo$year <= 2000, ]
-pdo <- pdo[order(pdo$year, pdo$month), ]
+
+pdo <- pdo[pdo$year >= 1875 & pdo$year <= 2000, ]   # window used by Huang et al.
+pdo <- pdo[order(pdo$year, pdo$month), ]            # chronological order
+
+# 12-month moving average: replace each month by the mean of it and the
+# previous 11, which strips out the seasonal cycle. align = "right" means the
+# window looks backwards; fill = NA leaves the first 11 months empty.
 pdo$ma <- rollmean(pdo$Value, k = 12, fill = NA, align = "right")
-pdo <- pdo[complete.cases(pdo), ]
-pdo$idx <- seq_len(nrow(pdo))
+
+pdo <- pdo[complete.cases(pdo), ]   # drop those first 11 empty months
+pdo$idx <- seq_len(nrow(pdo))       # 1, 2, 3, ... = position in the series
 ```
 
 ```{r fig-pdo-traj}
 #| fig-cap: "Monthly PDO index (grey) and its 12-month moving average (black), 1875-2000. Shaded: the test set (before 1920)."
+# Row index of the first month of 1920: the boundary between test set and
+# library. which.min(abs(...)) picks the row whose year is closest to 1920.
 L_pdo <- which.min(abs(pdo$year - 1920))
 
+# x = year expressed as a decimal, so months plot at the right position within
+# the year (e.g. July 1950 = 1950.5).
 ggplot(pdo, aes(year + (month - 1) / 12)) +
+  # Grey band marking the test-set period. inherit.aes = FALSE stops this layer
+  # from trying to use the x mapping above; -Inf/Inf mean "to the plot edge".
   geom_rect(xmin = -Inf, xmax = pdo$year[L_pdo], ymin = -Inf, ymax = Inf, fill = "grey90", inherit.aes = FALSE) +
-  geom_line(aes(y = Value), color = "grey70", linewidth = 0.2) +
-  geom_line(aes(y = ma), linewidth = 0.6) +
+  geom_line(aes(y = Value), color = "grey70", linewidth = 0.2) +   # raw monthly index
+  geom_line(aes(y = ma), linewidth = 0.6) +                        # 12-month average
   labs(x = "Year", y = "PDO index") +
   theme_minimal()
 ```
@@ -434,13 +560,17 @@ ggplot(pdo, aes(year + (month - 1) / 12)) +
 We use a coarser `Dskipstep` than for Lake Zurich (24 months) since this series is much longer (1501 months); with it, each right check still takes a few minutes.
 
 ```{r run_pdo}
-y_pdo <- pdo$ma
+y_pdo <- pdo$ma        # analyse the smoothed (12-month average) series
 T_pdo <- length(y_pdo)
 
-t0 <- Sys.time()
+# Only the RIGHT check here: the test set is the early period (pre-1920) and
+# the library is trimmed from its late end -- exactly as Huang et al. did.
+# Dskipstep = 24 means we step in 2-year jumps, since this series is long.
+t0 <- Sys.time()   # start the stopwatch
 right_pdo_gp <- nla_right(y_pdo, L = L_pdo, R = T_pdo, E = 3, tau = 1, Dskipstep = 24, bandwidth = 48)
-time_pdo_gp <- as.numeric(Sys.time() - t0, units = "secs")
+time_pdo_gp <- as.numeric(Sys.time() - t0, units = "secs")   # elapsed seconds
 
+# The same check with the original S-map forecaster, for comparison.
 t0 <- Sys.time()
 right_pdo_sm <- nla_right_smap(y_pdo, L = L_pdo, R = T_pdo, E = 3, tau = 1, Dskipstep = 24, bandwidth = 48)
 time_pdo_sm <- as.numeric(Sys.time() - t0, units = "secs")
@@ -448,6 +578,8 @@ time_pdo_sm <- as.numeric(Sys.time() - t0, units = "secs")
 
 ```{r tbl-pdo-summary}
 #| tbl-cap: "NLA-GP vs. NLA-S-map on the PDO index (right check only, as in Huang et al. 2024), vs. their reported ~1973."
+# Each method returns a row index; pdo$year[...] converts it into a calendar
+# year. The is.na() guards handle the case where no change point was found.
 tibble(Method = c("NLA-GP", "NLA-S-map"),
        `Detected year` = c(
          if (is.na(right_pdo_gp$tau_hat)) NA_character_ else as.character(round(pdo$year[round(right_pdo_gp$tau_hat)])),
